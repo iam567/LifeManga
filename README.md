@@ -41,17 +41,21 @@
 
 ## 截图
 
-> 在这放几张运行截图，README 比代码更值钱（先占位，跑起来之后再填）。
+### 创作页
 
-<!--
-| 工程列表 | 创作页 | 故事模式 |
-|---|---|---|
-| ![projects](docs/screenshots/projects.png) | ![home](docs/screenshots/home.png) | ![story](docs/screenshots/story.png) |
+<p align="center">
+  <img src="doc/home.jpg" alt="创作页" width="320">
+</p>
 
-| 角色库 | 任务面板 | 日志详情 |
-|---|---|---|
-| ![characters](docs/screenshots/characters.png) | ![tasks](docs/screenshots/tasks.png) | ![logs](docs/screenshots/logs.png) |
--->
+选素材图、续接前一张、载入角色、挑风格、补充 prompt——一个屏幕讲完。
+
+### 几张实际生成出来的漫画
+
+| 萌系四格 · 永康牛肉面 | 经典少年 Jump 风 · 大阪游记 | 经典少年 Jump 风 · 雪夜炸物 |
+|:---:|:---:|:---:|
+| <img src="doc/output-chibi.jpg" alt="萌系四格" width="240"> | <img src="doc/output-jump-osaka.jpg" alt="Jump大阪" width="240"> | <img src="doc/output-jump-snow.jpg" alt="Jump雪夜" width="240"> |
+
+> 这几张都是 App 里直接拍照 / 选图 + 选角色 + 选风格生成的，没有任何后期。
 
 ---
 
