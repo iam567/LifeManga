@@ -58,8 +58,38 @@ final class BackgroundTaskRunner: NSObject, URLSessionDataDelegate {
         var heartbeatTask: Task<Void, Never>?    // 上传完成后的"等待 OpenAI"心跳
     }
 
+    private struct TaskMetadata: Codable {
+        var jobId: UUID
+        var url: String
+    }
+
+    private struct OrphanBuffer {
+        var metadata: TaskMetadata
+        var data: Data = Data()
+    }
+
+    private struct RecoveredResponse: Codable {
+        var jobId: UUID
+        var url: String
+        var statusCode: Int?
+        var data: Data?
+        var errorMessage: String?
+        var recordedAt: Date = Date()
+    }
+
     private var pending: [Int: Pending] = [:]
+    private var orphanBuffers: [Int: OrphanBuffer] = [:]
     private let lock = NSLock()
+    private let fileManager = FileManager.default
+
+    private var recoveredResponsesDir: URL {
+        let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dir = documents.appendingPathComponent("RecoveredBackgroundResponses", isDirectory: true)
+        if !fileManager.fileExists(atPath: dir.path) {
+            try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
 
     /// 把 multipart / JSON body 先写到临时文件，再用 uploadTask 提交。
     /// 等待响应完成（即使 App 进了后台，系统也会继续）。
@@ -79,6 +109,13 @@ final class BackgroundTaskRunner: NSObject, URLSessionDataDelegate {
 
         // 2. 创建 task（先创建，后面 cancellation handler 也能引用）
         let urlTask = session.uploadTask(with: request, fromFile: tmpURL)
+        if let jobId, let url = request.url?.absoluteString {
+            let metadata = TaskMetadata(jobId: jobId, url: url)
+            if let data = try? JSONEncoder().encode(metadata),
+               let json = String(data: data, encoding: .utf8) {
+                urlTask.taskDescription = json
+            }
+        }
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { cont in
@@ -178,6 +215,10 @@ final class BackgroundTaskRunner: NSObject, URLSessionDataDelegate {
             }
             entry.data.append(data)
             pending[dataTask.taskIdentifier] = entry
+        } else if let metadata = taskMetadata(for: dataTask) {
+            var orphan = orphanBuffers[dataTask.taskIdentifier] ?? OrphanBuffer(metadata: metadata)
+            orphan.data.append(data)
+            orphanBuffers[dataTask.taskIdentifier] = orphan
         }
         lock.unlock()
         hbToCancel?.cancel()
@@ -195,6 +236,7 @@ final class BackgroundTaskRunner: NSObject, URLSessionDataDelegate {
                     didCompleteWithError error: Error?) {
         lock.lock()
         let entry = pending.removeValue(forKey: task.taskIdentifier)
+        let orphan = orphanBuffers.removeValue(forKey: task.taskIdentifier)
         lock.unlock()
 
         // 停掉心跳
@@ -205,7 +247,30 @@ final class BackgroundTaskRunner: NSObject, URLSessionDataDelegate {
             try? FileManager.default.removeItem(at: url)
         }
 
-        guard let entry else { return }
+        guard let entry else {
+            if let orphan {
+                persistRecoveredResponse(
+                    RecoveredResponse(
+                        jobId: orphan.metadata.jobId,
+                        url: orphan.metadata.url,
+                        statusCode: (task.response as? HTTPURLResponse)?.statusCode,
+                        data: orphan.data,
+                        errorMessage: error?.localizedDescription
+                    )
+                )
+            } else if let metadata = taskMetadata(for: task) {
+                persistRecoveredResponse(
+                    RecoveredResponse(
+                        jobId: metadata.jobId,
+                        url: metadata.url,
+                        statusCode: (task.response as? HTTPURLResponse)?.statusCode,
+                        data: nil,
+                        errorMessage: error?.localizedDescription
+                    )
+                )
+            }
+            return
+        }
 
         if let error {
             JobStore.log(entry.jobId,
@@ -237,6 +302,164 @@ final class BackgroundTaskRunner: NSObject, URLSessionDataDelegate {
             self?.backgroundCompletionHandler?()
             self?.backgroundCompletionHandler = nil
         }
+    }
+
+    @MainActor
+    func recoverPersistedResponses() {
+        let urls = (try? fileManager.contentsOfDirectory(at: recoveredResponsesDir,
+                                                         includingPropertiesForKeys: nil)) ?? []
+        for url in urls {
+            guard let data = try? Data(contentsOf: url),
+                  let response = try? JSONDecoder().decode(RecoveredResponse.self, from: data) else {
+                try? fileManager.removeItem(at: url)
+                continue
+            }
+            recover(response)
+            try? fileManager.removeItem(at: url)
+        }
+    }
+
+    @MainActor
+    private func recover(_ response: RecoveredResponse) {
+        guard let job = JobStore.shared.jobs.first(where: { $0.id == response.jobId }) else {
+            return
+        }
+        guard !job.phase.isFinal else { return }
+
+        if let errorMessage = response.errorMessage {
+            JobStore.shared.markTimeoutUnknown(
+                job.id,
+                message: "后台任务在 App 重启后返回，但原始等待链路已丢失：\(errorMessage)",
+                errorCode: "BG_RECOVERY_ERROR"
+            )
+            return
+        }
+
+        guard let statusCode = response.statusCode,
+              (200..<300).contains(statusCode),
+              let payload = response.data else {
+            let message = response.statusCode.map { "HTTP \($0)" } ?? "未知状态"
+            JobStore.shared.markTimeoutUnknown(
+                job.id,
+                message: "后台任务在 App 重启后返回，但响应无法自动恢复（\(message)）。",
+                errorCode: "BG_RECOVERY_INVALID"
+            )
+            return
+        }
+
+        switch job.kind {
+        case .simpleImage, .storyRender:
+            recoverMangaJob(job, payload: payload)
+        case .characterViews:
+            recoverCharacterJob(job, payload: payload)
+        case .storyScript:
+            JobStore.shared.markTimeoutUnknown(
+                job.id,
+                message: "编剧结果在 App 重启后返回，当前版本不会自动接回编辑界面。",
+                errorCode: "BG_RECOVERY_UNSUPPORTED"
+            )
+        }
+    }
+
+    @MainActor
+    private func recoverMangaJob(_ job: Job, payload: Data) {
+        guard let outputs = decodeImagesEditResponse(payload),
+              let inputFiles = job.inputImageFiles else {
+            JobStore.shared.markTimeoutUnknown(
+                job.id,
+                message: "后台图片任务已完成，但自动恢复解析失败。",
+                errorCode: "BG_RECOVERY_DECODE"
+            )
+            return
+        }
+        let inputDatas = inputFiles.compactMap {
+            JobStore.shared.loadPendingImage($0, jobId: job.id)?.pngData()
+        }
+        guard !inputDatas.isEmpty else {
+            JobStore.shared.markTimeoutUnknown(
+                job.id,
+                message: "后台图片任务已完成，但输入图快照已缺失，无法自动落库。",
+                errorCode: "BG_RECOVERY_INPUT_MISSING"
+            )
+            return
+        }
+        let projectId = job.projectId ?? ProjectStore.shared.ensureDefaultProject().id
+        let saved = MangaStorage.shared.add(
+            projectId: projectId,
+            style: job.style,
+            inputs: inputDatas,
+            outputs: outputs,
+            userPrompt: job.userPromptText,
+            storyScript: job.storyScriptSnapshot,
+            previousPage: job.previousPageFile.flatMap {
+                JobStore.shared.loadPendingImage($0, jobId: job.id)?.pngData()
+            },
+            loadedCharacterIds: job.characterIds,
+            loadedCharacterSelections: job.characterSelections,
+            bubbleTextMode: job.bubbleMode,
+            isColorOutput: job.wasColorOn,
+            imageCount: job.imageCount,
+            imageSize: job.imageSizeStr,
+            imageQuality: job.imageQualityStr
+        )
+        JobStore.shared.complete(job.id, with: saved.id)
+    }
+
+    @MainActor
+    private func recoverCharacterJob(_ job: Job, payload: Data) {
+        guard let outputs = decodeImagesEditResponse(payload),
+              let first = outputs.first,
+              let characterId = job.characterId else {
+            JobStore.shared.markTimeoutUnknown(
+                job.id,
+                message: "后台角色任务已完成，但自动恢复解析失败。",
+                errorCode: "BG_RECOVERY_DECODE"
+            )
+            return
+        }
+        let label = job.outputLabel ?? job.artStyle?.displayName
+        guard let label else {
+            JobStore.shared.markTimeoutUnknown(
+                job.id,
+                message: "后台角色任务已完成，但缺少视图标签，无法自动写回角色库。",
+                errorCode: "BG_RECOVERY_LABEL_MISSING"
+            )
+            return
+        }
+        CharacterStore.shared.addViews(to: characterId, views: [(label, first)])
+        JobStore.shared.complete(job.id, with: characterId)
+    }
+
+    private func taskMetadata(for task: URLSessionTask) -> TaskMetadata? {
+        guard let taskDescription = task.taskDescription,
+              let data = taskDescription.data(using: .utf8),
+              let metadata = try? JSONDecoder().decode(TaskMetadata.self, from: data) else {
+            return nil
+        }
+        return metadata
+    }
+
+    private func persistRecoveredResponse(_ response: RecoveredResponse) {
+        let url = recoveredResponsesDir.appendingPathComponent("\(response.jobId.uuidString).json")
+        guard let data = try? JSONEncoder().encode(response) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private func decodeImagesEditResponse(_ data: Data) -> [Data]? {
+        struct Resp: Decodable {
+            struct Item: Decodable {
+                let b64_json: String?
+            }
+            let data: [Item]
+        }
+        guard let response = try? JSONDecoder().decode(Resp.self, from: data) else {
+            return nil
+        }
+        let outputs: [Data] = response.data.compactMap { (item: Resp.Item) -> Data? in
+            guard let b64 = item.b64_json else { return nil }
+            return Data(base64Encoded: b64)
+        }
+        return outputs.isEmpty ? nil : outputs
     }
 }
 
@@ -376,7 +599,7 @@ enum OpenAIError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .missingAPIKey:
-            return "尚未配置 OpenAI API Key，请在「设置」中填入。"
+            return "尚未配置漫画后端地址或后端 API Key，请先到「设置」中填入。"
         case .invalidImage:
             return "图片读取失败，请重新选择。"
         case .requestFailed(let status, let body):
@@ -461,7 +684,7 @@ enum OpenAIError: LocalizedError {
             return "OpenAI 拒绝调用 gpt-image-2：你的账户尚未完成 organization 验证。\n\n请到 platform.openai.com → Settings → Organization 完成验证后再试。"
         }
 
-        return "OpenAI 请求失败 (HTTP \(status))：\(underlying)"
+        return "后端请求失败 (HTTP \(status))：\(underlying)"
     }
 
     /// 是否值得自动重试（5xx / 网关 / 限流 / 网络）
@@ -542,6 +765,79 @@ struct OpenAIImageRequest {
         }
         return parts.joined(separator: "\n\n")
     }
+
+    func groupedInputImagesForPages() -> [[UIImage]] {
+        guard !inputImages.isEmpty else { return [] }
+        let pageCount = max(1, n)
+        if pageCount == 1 { return [inputImages] }
+
+        if inputImages.count < pageCount {
+            return (0..<pageCount).map { index in
+                [inputImages[min(index, inputImages.count - 1)]]
+            }
+        }
+
+        var groups: [[UIImage]] = []
+        let base = inputImages.count / pageCount
+        let extra = inputImages.count % pageCount
+        var cursor = 0
+
+        for pageIndex in 0..<pageCount {
+            let count = base + (pageIndex < extra ? 1 : 0)
+            let nextCursor = min(inputImages.count, cursor + count)
+            groups.append(Array(inputImages[cursor..<nextCursor]))
+            cursor = nextCursor
+        }
+
+        return groups
+    }
+
+    func promptForSequentialPage(index: Int,
+                                 total: Int,
+                                 pageImageCount: Int,
+                                 hasPreviousGeneratedPage: Bool) -> String {
+        var parts: [String] = [stylePrompt]
+        parts.append(BubbleDirective.simpleMode(bubbleTextMode))
+        if previousPageImage != nil || hasPreviousGeneratedPage {
+            parts.append(BubbleDirective.continuityDirective)
+        }
+        if total > 1 {
+            if index == 0 {
+                parts.append("""
+                MULTI-PAGE STORY MODE:
+                You are generating page 1 of \(total) connected manga pages from a larger uploaded photo set.
+                This page should primarily use the CURRENT attached subset of \(pageImageCount) source photo(s).
+                Start a coherent story here. Leave natural room for continuation on the next page instead of resolving everything immediately.
+                """)
+            } else if index == total - 1 {
+                parts.append("""
+                MULTI-PAGE STORY MODE:
+                You are generating page \(index + 1) of \(total) connected manga pages from a larger uploaded photo set.
+                This page should primarily use the CURRENT attached subset of \(pageImageCount) source photo(s).
+                Continue directly from the immediately previous page and bring the mini-story to a satisfying conclusion here.
+                """)
+            } else {
+                parts.append("""
+                MULTI-PAGE STORY MODE:
+                You are generating page \(index + 1) of \(total) connected manga pages from a larger uploaded photo set.
+                This page should primarily use the CURRENT attached subset of \(pageImageCount) source photo(s).
+                Continue directly from the previous page, expand the same story, and keep clear momentum into the next page.
+                """)
+            }
+            parts.append("""
+            Do NOT try to retell every uploaded moment on every page.
+            Focus this page on the currently attached subset of photos, while keeping the same protagonist, tone, and story continuity across pages.
+            """)
+        }
+        if let cd = characterDirective {
+            parts.append(cd)
+        }
+        if let extra = userPrompt?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !extra.isEmpty {
+            parts.append("Additional user note: " + extra)
+        }
+        return parts.joined(separator: "\n\n")
+    }
 }
 
 /// 气泡 / 延续 等 prompt 的拼装工具
@@ -578,7 +874,7 @@ enum BubbleDirective {
             return """
             BUBBLE / TEXT INSTRUCTION:
             If you add speech bubbles, render the dialogue inside them in JAPANESE \
-            (hiragana/katakana, short natural manga-style lines, ≤ 8 kana per bubble). \
+            (natural manga-style Japanese, allowing kanji plus hiragana/katakana). \
             Do NOT use English. Do NOT use Chinese.
             """
         case "english":
@@ -621,6 +917,32 @@ struct OpenAIStoryRequest {
     var bubbleTextMode: String
     /// 彩色 / 黑白
     var isColor: Bool
+    /// 漫画化强度（0 偏实景，1 偏强漫画）
+    var stylizationStrength: Double
+    /// 是否尽量保留真实场景可识别性（尤其用于导航案内）
+    var preserveRealWorldReadability: Bool
+}
+
+private struct BackendConfig {
+    let baseURL: URL
+    let apiKey: String
+}
+
+private struct BackendTaskSubmission: Decodable {
+    let task_id: String
+    let status: String
+}
+
+private struct BackendTaskStatus: Decodable {
+    let id: String
+    let status: String
+    let output_count: Int?
+    let error_code: String?
+    let error_message: String?
+}
+
+private struct BackendStoryScriptResponse: Decodable {
+    let script: MangaStoryScript
 }
 
 // MARK: - Service
@@ -686,6 +1008,24 @@ final class OpenAIService {
                 JobStore.log(jobId, "重试已耗尽，最终失败: \(error.localizedDescription)", level: .error)
                 throw error
             }
+        }
+    }
+
+    @MainActor
+    func resumeServerBackedJobs() {
+        for job in JobStore.shared.jobs where job.phase.isRunning {
+            guard let backendTaskId = job.backendTaskId, !backendTaskId.isEmpty else { continue }
+            let task = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.resumeBackendTask(jobId: job.id,
+                                                     backendTaskId: backendTaskId,
+                                                     stageLabel: "正在与服务器同步任务状态…")
+                } catch {
+                    resolveJobError(error, jobId: job.id)
+                }
+            }
+            JobStore.shared.attachTask(task, to: job.id)
         }
     }
 
@@ -763,48 +1103,48 @@ final class OpenAIService {
         ]),
     ]
 
-    // MARK: 角色完整设定稿（一张图含主体 + 表情 + 服装 + 配饰 + 双语标注）
+    // MARK: 角色资产：标准立绘 / 高级设定图
 
-    /// 一次性生成一张"角色设定页"——背景 + 主体姿势 / 表情研究 / 衣物分解 / 配饰 /
-    /// 双语标签 / 箭头连线，整页单张大图。`artStyle` 控制整张图的艺术语言。
-    func generateCharacterSheet(sourcePhoto: UIImage,
-                                name: String,
-                                bio: String?,
-                                artStyle: CharacterArtStyle,
-                                size: String,
-                                quality: String,
-                                jobId: UUID? = nil,
-                                onStage: @MainActor @escaping (String) -> Void)
+    /// 先生成一张干净的标准立绘，后续高级设定图 / 动作合集都可以拿它做主参考。
+    func generateCharacterPortrait(sourcePhoto: UIImage,
+                                   name: String,
+                                   bio: String?,
+                                   ageGroup: CharacterAgeGroup,
+                                   gender: CharacterGender,
+                                   artStyle: CharacterArtStyle,
+                                   size: String,
+                                   quality: String,
+                                   jobId: UUID? = nil,
+                                   onStage: @MainActor @escaping (String) -> Void)
         async throws -> Data
     {
-        JobStore.log(jobId, "开始生成「\(artStyle.displayName)」设定稿")
+        JobStore.log(jobId, "开始生成「\(artStyle.displayName)」标准立绘")
         JobStore.log(jobId, "角色名: \(name)", level: .detail)
         if let b = bio, !b.isEmpty {
             JobStore.log(jobId, "角色设定: \(b)", level: .detail)
         }
-        guard let apiKey = currentKey() else {
-            JobStore.log(jobId, "❌ Keychain 没有 API Key", level: .error)
+        guard currentBackendConfig() != nil else {
+            JobStore.log(jobId, "❌ 未配置后端地址或后端 API Key", level: .error)
             throw OpenAIError.missingAPIKey
         }
-        JobStore.log(jobId, "已加载 API Key (sk-***\(apiKey.suffix(4)))", level: .detail)
-        await onStage("正在生成「\(artStyle.displayName)」设定稿…")
-        let prompt = buildCharacterSheetPrompt(name: name, bio: bio, artStyle: artStyle)
+        JobStore.log(jobId, "已加载 VPS 后端配置", level: .detail)
+        await onStage("正在生成「\(artStyle.displayName)」标准立绘…")
+        let prompt = buildCharacterPortraitPrompt(name: name,
+                                                 bio: bio,
+                                                 ageGroup: ageGroup,
+                                                 gender: gender,
+                                                 artStyle: artStyle)
         JobStore.log(jobId, "Prompt 已构造 (\(prompt.count) 字符)", level: .detail)
 
-        let datas = try await withRetry(label: "生成「\(artStyle.displayName)」",
-                                        allowAutoRetry: false,    // 图像接口禁止自动重试
-                                        onRetry: onStage,
-                                        jobId: jobId) {
-            try await self.callImagesEdit(
-                apiKey: apiKey,
-                images: [sourcePhoto],
-                prompt: prompt,
-                n: 1,
-                size: size,
-                quality: quality,
-                jobId: jobId
-            )
-        }
+        let datas = try await submitImageTask(
+            images: [sourcePhoto],
+            prompt: prompt,
+            n: 1,
+            size: size,
+            quality: quality,
+            jobId: jobId,
+            onStage: onStage
+        )
         guard let first = datas.first else {
             JobStore.log(jobId, "OpenAI 返回空 data 数组", level: .error)
             throw OpenAIError.unknown("未生成任何图像")
@@ -813,25 +1153,128 @@ final class OpenAIService {
         return first
     }
 
-    private func buildCharacterSheetPrompt(name: String,
-                                           bio: String?,
-                                           artStyle: CharacterArtStyle) -> String {
-        // 渐进式增加细节版（~950 字符固定）。
-        // 加：顶部双语标题；右侧 1 个标志性配饰特写 + 箭头指向角色。
+    /// 一次性生成一张复杂角色设定页——主体 + 表情区 + 服装/配饰/生活物件 + 细节 callout。
+    func generateAdvancedCharacterSheet(sourcePhoto: UIImage,
+                                        basePortrait: UIImage?,
+                                        name: String,
+                                        bio: String?,
+                                        ageGroup: CharacterAgeGroup,
+                                        gender: CharacterGender,
+                                        artStyle: CharacterArtStyle,
+                                        size: String,
+                                        quality: String,
+                                        jobId: UUID? = nil,
+                                        onStage: @MainActor @escaping (String) -> Void)
+        async throws -> Data
+    {
+        JobStore.log(jobId, "开始生成「\(artStyle.displayName)」高级设定图")
+        JobStore.log(jobId, "角色名: \(name)", level: .detail)
+        if let b = bio, !b.isEmpty {
+            JobStore.log(jobId, "角色设定: \(b)", level: .detail)
+        }
+        guard currentBackendConfig() != nil else {
+            JobStore.log(jobId, "❌ 未配置后端地址或后端 API Key", level: .error)
+            throw OpenAIError.missingAPIKey
+        }
+        JobStore.log(jobId, "已加载 VPS 后端配置", level: .detail)
+        await onStage("正在生成「\(artStyle.displayName)」高级设定图…")
+        let prompt = buildAdvancedCharacterSheetPrompt(name: name,
+                                                       bio: bio,
+                                                       ageGroup: ageGroup,
+                                                       gender: gender,
+                                                       artStyle: artStyle)
+        JobStore.log(jobId, "Prompt 已构造 (\(prompt.count) 字符)", level: .detail)
+
+        var images: [UIImage] = []
+        if let basePortrait { images.append(basePortrait) }
+        images.append(sourcePhoto)
+        let datas = try await submitImageTask(
+            images: images,
+            prompt: prompt,
+            n: 1,
+            size: size,
+            quality: quality,
+            jobId: jobId,
+            onStage: onStage
+        )
+        guard let first = datas.first else {
+            JobStore.log(jobId, "OpenAI 返回空 data 数组", level: .error)
+            throw OpenAIError.unknown("未生成任何图像")
+        }
+        JobStore.log(jobId, "解析成功，图像 \(first.count / 1024) KB ✓", level: .success)
+        return first
+    }
+
+    private func buildCharacterPortraitPrompt(name: String,
+                                              bio: String?,
+                                              ageGroup: CharacterAgeGroup,
+                                              gender: CharacterGender,
+                                              artStyle: CharacterArtStyle) -> String {
         var lines: [String] = []
-        lines.append("Stylize the adult person in the reference photo into a polished character illustration.")
+        lines.append("Create a polished full-body CHARACTER PORTRAIT based on the reference photo.")
+        lines.append("This is NOT a collage or design board. It must be a single clean standing character illustration.")
         lines.append("")
-        lines.append("Composition (single image, white background):")
-        lines.append("• Center: full-body or 3/4 body portrait, natural pose, signature outfit.")
-        lines.append("• Top-right: 4 small head sketches with different expressions (smile / thoughtful / laugh / calm).")
-        lines.append("• Right side: 1 signature accessory (glasses/watch/scarf etc fitting the bio) as a small callout with bilingual caption (中文 / English), thin arrow pointing to the spot on the character.")
-        lines.append("• Bottom: 3 small life-style items (journal / phone / coffee / bag etc fitting the bio), each with a tiny bilingual caption (中文 / English).")
+        lines.append("Composition:")
+        lines.append("• One \(ageGroup.promptPhrase) \(gender.promptPhrase) character only, full body visible from head to shoes.")
+        lines.append("• Plain pure white or very light neutral studio background.")
+        lines.append("• Clean silhouette, natural relaxed standing pose, fashion-illustration presentation.")
+        lines.append("• No extra props, no text, no labels, no callout boxes, no duplicate heads.")
         lines.append("")
         lines.append("Character: \(name).\(bio.flatMap { $0.isEmpty ? nil : " \($0)." } ?? "")")
         lines.append("")
         lines.append("Art style: \(artStyle.prompt)")
         lines.append("")
-        lines.append("Rules: ADULT character (not a child). Modest clothing. White background. Match face/hair/build from photo. Same person in all expressions. Real legible Chinese characters.")
+        lines.append("Rules: The character should clearly read as \(ageGroup.promptPhrase) and \(gender.promptPhrase), not another life stage. Match face, hair, body build and vibe from the source photo as closely as the policy allows. Make the outfit feel signature and coherent with the bio. Render in full color. Premium clean character reference illustration quality.")
+        return lines.joined(separator: "\n")
+    }
+
+    private func buildAdvancedCharacterSheetPrompt(name: String,
+                                                   bio: String?,
+                                                   ageGroup: CharacterAgeGroup,
+                                                   gender: CharacterGender,
+                                                   artStyle: CharacterArtStyle) -> String {
+        let moodItems: String
+        switch artStyle {
+        case .jpAnime, .krManhwa:
+            moodItems = "journal, phone, bag, drink, accessory"
+        case .semiReal:
+            moodItems = "friendly backpack, storybook, drink cup, badge, playful accessory"
+        case .usComics:
+            moodItems = "gear, bag, notebook, device, accessory"
+        case .kawaii, .chibi:
+            moodItems = "cute bag, phone charm, snack, notebook, accessory"
+        case .render3D:
+            moodItems = "tech gadget, bag, drink, accessory, notebook"
+        case .watercolor:
+            moodItems = "book, perfume, scarf, notebook, accessory"
+        case .pixelArt:
+            moodItems = "retro bag, handheld device, notebook, drink, accessory"
+        }
+        var lines: [String] = []
+        lines.append("Create a richly designed CHARACTER DESIGN BOARD / REFERENCE SHEET on ONE page.")
+        lines.append("This should feel like a premium anime / manga / illustration character setup board, not a simple collage.")
+        lines.append("")
+        lines.append("Layout:")
+        lines.append("• Center: one large full-body main character as the hero image.")
+        lines.append("• Top-right: 4 to 5 expression portraits with varied emotions.")
+        lines.append("• Left side: outfit breakdown pieces or clothing components.")
+        lines.append("• Bottom area: 4 to 6 personal belongings / lifestyle items related to the character.")
+        lines.append("• Add 2 to 4 zoomed detail callout boxes (fabric, hair, accessory, hand detail, texture, etc).")
+        lines.append("• Use arrows, framed sections, and clean editorial spacing to organize the board.")
+        lines.append("")
+        lines.append("Character: \(name).\(bio.flatMap { $0.isEmpty ? nil : " \($0)." } ?? "")")
+        lines.append("Target profile: \(ageGroup.promptPhrase), \(gender.promptPhrase).")
+        lines.append("Personal item inspiration: \(moodItems).")
+        lines.append("")
+        lines.append("Art style: \(artStyle.prompt)")
+        lines.append("")
+        lines.append("Rules:")
+        lines.append("• Keep the character clearly within the requested life stage (\(ageGroup.promptPhrase)) and gender presentation (\(gender.promptPhrase)).")
+        lines.append("• Keep the SAME person across main figure and all portraits.")
+        lines.append("• Use a refined design-board aesthetic with off-white paper or clean grid/studio sheet background.")
+        lines.append("• Text, if any, must be minimal short labels only. Prioritize visuals over dense writing.")
+        lines.append("• The board should feel information-rich, curated, and professionally art-directed.")
+        lines.append("• Full color, polished, attractive, collectible concept-sheet quality.")
         return lines.joined(separator: "\n")
     }
 
@@ -839,6 +1282,8 @@ final class OpenAIService {
     func generatePoseSheet(sourcePhoto: UIImage,
                            name: String,
                            bio: String?,
+                           ageGroup: CharacterAgeGroup,
+                           gender: CharacterGender,
                            specs: [CharacterViewSpec],
                            style: MangaStyle,
                            isColor: Bool,
@@ -849,29 +1294,28 @@ final class OpenAIService {
         async throws -> Data
     {
         JobStore.log(jobId, "开始生成动作合集（\(specs.count) 个动作合并到一张图）")
-        guard let apiKey = currentKey() else {
-            JobStore.log(jobId, "❌ Keychain 没有 API Key", level: .error)
+        guard currentBackendConfig() != nil else {
+            JobStore.log(jobId, "❌ 未配置后端地址或后端 API Key", level: .error)
             throw OpenAIError.missingAPIKey
         }
         await onStage("正在生成动作合集（\(specs.count) 个动作）…")
-        let prompt = buildPoseSheetPrompt(name: name, bio: bio, specs: specs,
+        let prompt = buildPoseSheetPrompt(name: name,
+                                          bio: bio,
+                                          ageGroup: ageGroup,
+                                          gender: gender,
+                                          specs: specs,
                                           style: style, isColor: isColor)
         JobStore.log(jobId, "Prompt 已构造 (\(prompt.count) 字符)", level: .detail)
 
-        let datas = try await withRetry(label: "生成动作合集",
-                                        allowAutoRetry: false,    // 图像接口禁止自动重试
-                                        onRetry: onStage,
-                                        jobId: jobId) {
-            try await self.callImagesEdit(
-                apiKey: apiKey,
-                images: [sourcePhoto],
-                prompt: prompt,
-                n: 1,
-                size: size,
-                quality: quality,
-                jobId: jobId
-            )
-        }
+        let datas = try await submitImageTask(
+            images: [sourcePhoto],
+            prompt: prompt,
+            n: 1,
+            size: size,
+            quality: quality,
+            jobId: jobId,
+            onStage: onStage
+        )
         guard let first = datas.first else {
             throw OpenAIError.unknown("未生成任何图像")
         }
@@ -881,11 +1325,13 @@ final class OpenAIService {
 
     private func buildPoseSheetPrompt(name: String,
                                       bio: String?,
+                                      ageGroup: CharacterAgeGroup,
+                                      gender: CharacterGender,
                                       specs: [CharacterViewSpec],
                                       style: MangaStyle,
                                       isColor: Bool) -> String {
         var lines: [String] = []
-        lines.append("Create a single character pose sheet illustration on plain white background — show the SAME adult character drawn \(specs.count) times in different poses, all arranged on ONE page.")
+        lines.append("Create a single character pose sheet illustration on plain white background — show the SAME \(ageGroup.promptPhrase) \(gender.promptPhrase) character drawn \(specs.count) times in different poses, all arranged on ONE page.")
         lines.append("")
         lines.append("Character: \(name).\(bio.flatMap { $0.isEmpty ? nil : " \($0)." } ?? "")")
         lines.append("")
@@ -899,7 +1345,8 @@ final class OpenAIService {
         lines.append("Art style:")
         lines.append(style.effectivePrompt(isColor: isColor))
         lines.append("")
-        lines.append("Rules: ADULT character (not a child). Modest clothing. Plain white background. Match face/hair/build from reference photo. Same person in ALL poses. Real legible Chinese characters.")
+        lines.append("Color requirement: render the entire pose sheet in full color. Never make it monochrome, grayscale, ink-only, manga black-and-white, or sketch-only.")
+        lines.append("Rules: ADULT character (not a child). Modest clothing. Plain white background. Match face/hair/build/outfit/style from the chosen reference image. Same person in ALL poses. Real legible Chinese characters.")
         return lines.joined(separator: "\n")
     }
 
@@ -915,7 +1362,7 @@ final class OpenAIService {
                                 onStage: @MainActor @escaping (String) -> Void)
         async throws -> [(label: String, data: Data)]
     {
-        guard let apiKey = currentKey() else { throw OpenAIError.missingAPIKey }
+        guard currentBackendConfig() != nil else { throw OpenAIError.missingAPIKey }
 
         var results: [(label: String, data: Data)] = []
         var failures: [(label: String, message: String)] = []
@@ -929,18 +1376,14 @@ final class OpenAIService {
                                               style: style,
                                               isColor: isColor)
             do {
-                let datas = try await withRetry(label: "正在生成「\(spec.label)」",
-                                                 allowAutoRetry: false, // 图像接口禁止自动重试
-                                                 onRetry: onStage) {
-                    try await self.callImagesEdit(
-                        apiKey: apiKey,
-                        images: [sourcePhoto],
-                        prompt: prompt,
-                        n: 1,
-                        size: "1024x1536",
-                        quality: "medium"
-                    )
-                }
+                let datas = try await submitImageTask(
+                    images: [sourcePhoto],
+                    prompt: prompt,
+                    n: 1,
+                    size: "1024x1536",
+                    quality: "medium",
+                    onStage: onStage
+                )
                 if let first = datas.first {
                     results.append((label: spec.label, data: first))
                 }
@@ -997,36 +1440,77 @@ final class OpenAIService {
             (request.previousPageImage != nil ? " · 含前一张参考" : "") +
             (request.characterReferenceImages.isEmpty ? "" : " · 含 \(request.characterReferenceImages.count) 个角色参考"),
             level: .detail)
-        guard let apiKey = currentKey() else {
-            JobStore.log(jobId, "❌ Keychain 没有 API Key", level: .error)
+        guard currentBackendConfig() != nil else {
+            JobStore.log(jobId, "❌ 未配置后端地址或后端 API Key", level: .error)
             throw OpenAIError.missingAPIKey
         }
         guard !request.inputImages.isEmpty else {
             JobStore.log(jobId, "❌ 用户没传图片", level: .error)
             throw OpenAIError.invalidImage
         }
-        JobStore.log(jobId, "已加载 API Key (sk-***\(apiKey.suffix(4)))", level: .detail)
-        JobStore.log(jobId, "Prompt 已构造 (\(request.combinedPrompt.count) 字符)", level: .detail)
+        JobStore.log(jobId, "已加载 VPS 后端配置", level: .detail)
+        if request.n <= 1 {
+            JobStore.log(jobId, "Prompt 已构造 (\(request.combinedPrompt.count) 字符)", level: .detail)
 
-        // 顺序：前一张 → 用户照片 → 角色参考图
-        var images: [UIImage] = []
-        if let prev = request.previousPageImage { images.append(prev) }
-        images.append(contentsOf: request.inputImages)
-        images.append(contentsOf: request.characterReferenceImages)
-        return try await withRetry(label: "AI 正在挥笔作画…",
-                                   allowAutoRetry: false,    // 图像接口禁止自动重试
-                                   onRetry: onStage,
-                                   jobId: jobId) {
-            try await callImagesEdit(
-                apiKey: apiKey,
+            // 顺序：前一张 → 用户照片 → 角色参考图
+            var images: [UIImage] = []
+            if let prev = request.previousPageImage { images.append(prev) }
+            images.append(contentsOf: request.inputImages)
+            images.append(contentsOf: request.characterReferenceImages)
+            return try await submitImageTask(
                 images: images,
                 prompt: request.combinedPrompt,
                 n: request.n,
                 size: request.size,
                 quality: request.quality,
-                jobId: jobId
+                jobId: jobId,
+                onStage: onStage
             )
         }
+
+        JobStore.log(jobId, "进入多页连续生成模式：共 \(request.n) 页", level: .detail)
+        var pages: [Data] = []
+        var previousGeneratedPage: UIImage? = nil
+        let pageInputGroups = request.groupedInputImagesForPages()
+
+        for index in 0..<request.n {
+            await onStage?("正在生成连续剧情第 \(index + 1)/\(request.n) 页…")
+            let pageInputs = index < pageInputGroups.count ? pageInputGroups[index] : request.inputImages
+
+            var images: [UIImage] = []
+            if let previousGeneratedPage {
+                images.append(previousGeneratedPage)
+            } else if let prev = request.previousPageImage {
+                images.append(prev)
+            }
+            images.append(contentsOf: pageInputs)
+            images.append(contentsOf: request.characterReferenceImages)
+
+            let prompt = request.promptForSequentialPage(
+                index: index,
+                total: request.n,
+                pageImageCount: pageInputs.count,
+                hasPreviousGeneratedPage: previousGeneratedPage != nil
+            )
+            JobStore.log(jobId, "第 \(index + 1) 页 Prompt 已构造 (\(prompt.count) 字符)", level: .detail)
+
+            let datas = try await submitImageTask(
+                images: images,
+                prompt: prompt,
+                n: 1,
+                size: request.size,
+                quality: request.quality,
+                jobId: jobId,
+                onStage: onStage
+            )
+            guard let first = datas.first else {
+                throw OpenAIError.unknown("第 \(index + 1) 页未生成任何图像")
+            }
+            pages.append(first)
+            previousGeneratedPage = UIImage(data: first)
+        }
+
+        return pages
     }
 
     // MARK: 故事模式：第 1 步 —— 只编剧本（不画）
@@ -1038,26 +1522,21 @@ final class OpenAIService {
     {
         JobStore.log(jobId, "开始故事模式 第 1 步：编剧（\(request.scriptModel)）")
         JobStore.log(jobId, "用户图: \(request.inputImages.count) 张, 期望分镜: \(request.panelCount) 格", level: .detail)
-        guard let apiKey = currentKey() else {
-            JobStore.log(jobId, "❌ Keychain 没有 API Key", level: .error)
+        guard currentBackendConfig() != nil else {
+            JobStore.log(jobId, "❌ 未配置后端地址或后端 API Key", level: .error)
             throw OpenAIError.missingAPIKey
         }
         guard !request.inputImages.isEmpty else { throw OpenAIError.invalidImage }
-        JobStore.log(jobId, "已加载 API Key (sk-***\(apiKey.suffix(4)))", level: .detail)
+        JobStore.log(jobId, "已加载 VPS 后端配置", level: .detail)
         await onStage("AI 正在脑补剧情…")
         return try await withRetry(label: "AI 正在脑补剧情…",
                                    allowAutoRetry: true,    // 文本接口允许自动重试（不烧 GPU 配额）
                                    onRetry: onStage,
                                    jobId: jobId) {
-            try await generateScript(
-                apiKey: apiKey,
-                images: request.inputImages,
-                previousPage: request.previousPageImage,
-                style: request.style,
-                userHint: request.userHint,
-                panelCount: request.panelCount,
-                model: request.scriptModel,
-                jobId: jobId
+            try await callBackendStoryScript(
+                request,
+                jobId: jobId,
+                onStage: onStage
             )
         }
     }
@@ -1072,18 +1551,20 @@ final class OpenAIService {
     {
         JobStore.log(jobId, "开始故事模式 第 2 步：分镜作画（\(script.panels.count) 格）")
         JobStore.log(jobId, "剧本标题: \(script.title)", level: .detail)
-        guard let apiKey = currentKey() else {
-            JobStore.log(jobId, "❌ Keychain 没有 API Key", level: .error)
+        guard currentBackendConfig() != nil else {
+            JobStore.log(jobId, "❌ 未配置后端地址或后端 API Key", level: .error)
             throw OpenAIError.missingAPIKey
         }
         guard !request.inputImages.isEmpty else { throw OpenAIError.invalidImage }
-        JobStore.log(jobId, "已加载 API Key (sk-***\(apiKey.suffix(4)))", level: .detail)
+        JobStore.log(jobId, "已加载 VPS 后端配置", level: .detail)
 
         await onStage("AI 正在分镜作画…（需要 1~3 分钟）")
         var renderPrompt = buildRenderPrompt(style: request.style,
                                              script: script,
                                              bubbleMode: request.bubbleTextMode,
-                                             isColor: request.isColor)
+                                             isColor: request.isColor,
+                                             stylizationStrength: request.stylizationStrength,
+                                             preserveRealWorldReadability: request.preserveRealWorldReadability)
         // 前一张图片：拼成第 1 张参考 + 在 prompt 里追加风格延续指令
         var images: [UIImage] = []
         if let prev = request.previousPageImage {
@@ -1097,20 +1578,15 @@ final class OpenAIService {
         }
         JobStore.log(jobId, "Prompt 已构造 (\(renderPrompt.count) 字符)", level: .detail)
 
-        return try await withRetry(label: "AI 正在分镜作画…",
-                                   allowAutoRetry: false,    // 图像接口禁止自动重试
-                                   onRetry: onStage,
-                                   jobId: jobId) {
-            try await callImagesEdit(
-                apiKey: apiKey,
-                images: images,
-                prompt: renderPrompt,
-                n: 1,
-                size: request.size,
-                quality: request.quality,
-                jobId: jobId
-            )
-        }
+        return try await submitImageTask(
+            images: images,
+            prompt: renderPrompt,
+            n: 1,
+            size: request.size,
+            quality: request.quality,
+            jobId: jobId,
+            onStage: onStage
+        )
     }
 
     // MARK: 故事模式：一次性两步（保留作为简便接口）
@@ -1131,6 +1607,8 @@ final class OpenAIService {
     private func generateScript(apiKey: String,
                                 images: [UIImage],
                                 previousPage: UIImage? = nil,
+                                characterImages: [UIImage] = [],
+                                characterDirective: String? = nil,
                                 style: MangaStyle,
                                 userHint: String?,
                                 panelCount: Int,
@@ -1157,6 +1635,8 @@ final class OpenAIService {
         Style guide for tone: \(style.prompt)
 
         \(hintLine)
+
+        \(characterDirective ?? "")
 
         Design a \(panelCount)-panel manga page. You are NOT required to use one panel per \
         input photo — invent extra panels if useful: establishing shots, emotion close-ups, \
@@ -1212,6 +1692,22 @@ final class OpenAIService {
         }
 
         for img in images {
+            guard let data = img.compressForUpload(targetKB: 250, startMaxDimension: 768)
+            else { throw OpenAIError.invalidImage }
+            let dataURL = "data:image/jpeg;base64," + data.base64EncodedString()
+            contentArray.append([
+                "type": "image_url",
+                "image_url": ["url": dataURL]
+            ])
+        }
+
+        if !characterImages.isEmpty {
+            contentArray.append([
+                "type": "text",
+                "text": "The following image(s) are recurring CHARACTER REFERENCES. Keep these exact people/character designs consistent when writing the page."
+            ])
+        }
+        for img in characterImages {
             guard let data = img.compressForUpload(targetKB: 250, startMaxDimension: 768)
             else { throw OpenAIError.invalidImage }
             let dataURL = "data:image/jpeg;base64," + data.base64EncodedString()
@@ -1277,7 +1773,9 @@ final class OpenAIService {
     private func buildRenderPrompt(style: MangaStyle,
                                    script: MangaStoryScript,
                                    bubbleMode: String,
-                                   isColor: Bool) -> String {
+                                   isColor: Bool,
+                                   stylizationStrength: Double = 0.78,
+                                   preserveRealWorldReadability: Bool = false) -> String {
 
         func clean(_ s: String?) -> String? {
             guard let s = s?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1287,7 +1785,9 @@ final class OpenAIService {
 
         var lines: [String] = []
         lines.append("Create a SINGLE full Japanese manga page in this style:")
-        lines.append(style.effectivePrompt(isColor: isColor))
+        lines.append(style.effectivePrompt(isColor: isColor,
+                                           stylizationStrength: stylizationStrength,
+                                           preserveRealWorldReadability: preserveRealWorldReadability))
         lines.append("")
         lines.append("Layout: arrange \(script.panels.count) panels in a classic manga grid with clear \(isColor ? "" : "black ")gutters between panels. Vary panel sizes for dramatic effect (e.g., one larger splash panel). Use the provided reference photos to keep characters and locations visually consistent.")
         lines.append("")
@@ -1348,15 +1848,15 @@ final class OpenAIService {
                     lines.append("  Narration caption box — render a natural English translation of this Chinese narration: \(n)")
                 }
 
-            default: // "japanese": 气泡里画日文假名
+            default: // "japanese": 气泡里画日语
                 if let ja = jaDialogue {
-                    lines.append("  Speech bubble — render this Japanese kana text VERBATIM, large and clearly readable: 「\(ja)」")
+                    lines.append("  Speech bubble — render this Japanese text VERBATIM, large and clearly readable: 「\(ja)」")
                 } else if let zh = zhDialogue {
                     // 用户改了中文但没同步日文，让模型现场翻译
-                    lines.append("  Speech bubble — render a natural short Japanese kana translation (≤ 8 kana) of this Chinese line: \(zh)")
+                    lines.append("  Speech bubble — render a natural short Japanese translation of this Chinese line, using normal Japanese writing with kanji and kana as appropriate: \(zh)")
                 }
                 if let ja = jaNarration {
-                    lines.append("  Narration caption box — render this Japanese kana text VERBATIM: 「\(ja)」")
+                    lines.append("  Narration caption box — render this Japanese text VERBATIM: 「\(ja)」")
                 } else if let zh = zhNarration {
                     lines.append("  Narration caption box — render a natural short Japanese translation of this Chinese line: \(zh)")
                 }
@@ -1384,12 +1884,350 @@ final class OpenAIService {
         case "english":
             lines.append("- All bubble/caption text must be in clean readable English. Do NOT use Chinese or Japanese in bubbles.")
         default: // japanese
-            lines.append("- Render Japanese kana text in bubbles VERBATIM, large and crisp. Do not invent additional Chinese or English text.")
+            lines.append("- Render Japanese text in bubbles VERBATIM, large and crisp, using normal Japanese writing with kanji and kana where appropriate. Do not invent additional Chinese or English text.")
         }
         lines.append("- Sound effects: large dramatic stylized lettering integrated into the artwork.")
         lines.append("- Maintain visual consistency of any recurring character/location across panels.")
         lines.append("- Page composition should feel like a real Weekly Shonen Jump / seinen manga page.")
         return lines.joined(separator: "\n")
+    }
+
+    private func submitImageTask(images: [UIImage],
+                                 prompt: String,
+                                 n: Int,
+                                 size: String,
+                                 quality: String,
+                                 jobId: UUID? = nil,
+                                 onStage: (@MainActor (String) -> Void)? = nil) async throws -> [Data] {
+        guard let config = currentBackendConfig() else { throw OpenAIError.missingAPIKey }
+
+        final class SubmissionBox {
+            var taskId: String?
+        }
+        let box = SubmissionBox()
+
+        return try await withTaskCancellationHandler {
+            let files = try images.enumerated().map { idx, image in
+                guard let data = image.compressForUpload(targetKB: 500, startMaxDimension: 1024) else {
+                    throw OpenAIError.invalidImage
+                }
+                return (field: "images", filename: "input_\(idx).jpg", mime: "image/jpeg", data: data)
+            }
+            let fields = [
+                ("prompt", prompt),
+                ("n", String(max(1, min(n, 4)))),
+                ("size", size),
+                ("quality", quality)
+            ]
+            let (request, body) = try makeMultipartRequest(
+                config: config,
+                path: "/api/tasks",
+                fields: fields,
+                files: files
+            )
+            let (data, response) = try await BackgroundTaskRunner.shared.upload(request, body: body, jobId: jobId)
+            guard let http = response as? HTTPURLResponse else {
+                throw OpenAIError.unknown("Invalid backend response")
+            }
+            if http.statusCode == 409 {
+                let message = String(data: data, encoding: .utf8) ?? "duplicate_request"
+                throw OpenAIError.unknown("服务器检测到短时间内重复提交，已拦截本次请求。\n\n\(message)")
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                let bodyString = String(data: data, encoding: .utf8) ?? "<binary>"
+                throw OpenAIError.requestFailed(status: http.statusCode, body: bodyString)
+            }
+            let submission = try decodeJSON(BackendTaskSubmission.self, from: data)
+            box.taskId = submission.task_id
+            if let jobId {
+                await MainActor.run {
+                    JobStore.shared.updateBackendTaskId(jobId, submission.task_id)
+                    JobStore.shared.updateStage(jobId, "素材已上传，服务器开始排队…")
+                }
+            }
+            return try await pollBackendTaskResults(jobId: jobId,
+                                                    backendTaskId: submission.task_id,
+                                                    stageLabel: "服务器正在生成图片…",
+                                                    onStage: onStage)
+        } onCancel: {
+            guard let taskId = box.taskId,
+                  let config = self.currentBackendConfig() else { return }
+            Task { try? await self.cancelBackendTask(taskId: taskId, config: config) }
+        }
+    }
+
+    private func callBackendStoryScript(_ request: OpenAIStoryRequest,
+                                        jobId: UUID? = nil,
+                                        onStage: @MainActor @escaping (String) -> Void) async throws -> MangaStoryScript {
+        guard let config = currentBackendConfig() else { throw OpenAIError.missingAPIKey }
+
+        var files: [(field: String, filename: String, mime: String, data: Data)] = []
+        if let previous = request.previousPageImage {
+            guard let data = previous.compressForUpload(targetKB: 500, startMaxDimension: 1024) else {
+                throw OpenAIError.invalidImage
+            }
+            files.append((field: "previousPage", filename: "previous.jpg", mime: "image/jpeg", data: data))
+        }
+        for (idx, image) in request.inputImages.enumerated() {
+            guard let data = image.compressForUpload(targetKB: 500, startMaxDimension: 1024) else {
+                throw OpenAIError.invalidImage
+            }
+            files.append((field: "images", filename: "image_\(idx).jpg", mime: "image/jpeg", data: data))
+        }
+        for (idx, image) in request.characterReferenceImages.enumerated() {
+            guard let data = image.compressForUpload(targetKB: 500, startMaxDimension: 1024) else {
+                throw OpenAIError.invalidImage
+            }
+            files.append((field: "characterImages", filename: "character_\(idx).jpg", mime: "image/jpeg", data: data))
+        }
+
+        let fields = [
+            ("styleDisplayName", request.style.displayName),
+            ("styleSubtitle", request.style.subtitle),
+            ("stylePrompt", request.style.prompt),
+            ("userHint", request.userHint ?? ""),
+            ("panelCount", String(request.panelCount)),
+            ("model", request.scriptModel),
+            ("characterDirective", request.characterDirective ?? "")
+        ]
+        let (req, body) = try makeMultipartRequest(
+            config: config,
+            path: "/api/story-script",
+            fields: fields,
+            files: files
+        )
+        let (data, response) = try await BackgroundTaskRunner.shared.upload(req, body: body, jobId: jobId)
+        guard let http = response as? HTTPURLResponse else {
+            throw OpenAIError.unknown("Invalid backend response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let bodyString = String(data: data, encoding: .utf8) ?? "<binary>"
+            throw OpenAIError.requestFailed(status: http.statusCode, body: bodyString)
+        }
+        let result = try decodeJSON(BackendStoryScriptResponse.self, from: data)
+        await onStage("剧情已经构思完成，等待你确认分镜…")
+        return result.script
+    }
+
+    private func pollBackendTaskResults(jobId: UUID?,
+                                        backendTaskId: String,
+                                        stageLabel: String,
+                                        onStage: (@MainActor (String) -> Void)? = nil) async throws -> [Data] {
+        let status = try await resumeBackendTask(jobId: jobId,
+                                                 backendTaskId: backendTaskId,
+                                                 stageLabel: stageLabel,
+                                                 onStage: onStage,
+                                                 finalize: false)
+        return try await downloadBackendOutputs(taskId: backendTaskId,
+                                                outputCount: max(status.output_count ?? 1, 1))
+    }
+
+    @discardableResult
+    private func resumeBackendTask(jobId: UUID?,
+                                   backendTaskId: String,
+                                   stageLabel: String,
+                                   onStage: (@MainActor (String) -> Void)? = nil,
+                                   finalize: Bool = true) async throws -> BackendTaskStatus {
+        while true {
+            try Task.checkCancellation()
+            let status = try await fetchBackendTaskStatus(taskId: backendTaskId)
+            switch status.status {
+            case "pending":
+                if let onStage { await onStage("服务器已收到请求，等待排队…") }
+                if let jobId { await MainActor.run { JobStore.shared.updateStage(jobId, "服务器已收到请求，等待排队…") } }
+            case "openai_processing":
+                if let onStage { await onStage(stageLabel) }
+                if let jobId { await MainActor.run { JobStore.shared.updateStage(jobId, stageLabel) } }
+            case "completed":
+                if finalize, let jobId {
+                    let outputs = try await downloadBackendOutputs(taskId: backendTaskId,
+                                                                   outputCount: max(status.output_count ?? 1, 1))
+                    await finalizeServerBackedJob(jobId: jobId, outputs: outputs)
+                }
+                return status
+            case "failed":
+                throw OpenAIError.unknown(status.error_message ?? "服务器任务失败")
+            case "timeout_unknown":
+                throw OpenAIError.unknown(status.error_message ?? "服务器与 OpenAI 通信超时，结果未知。")
+            case "cancelled", "cancel_requested":
+                throw CancellationError()
+            default:
+                throw OpenAIError.unknown("服务器返回未知任务状态：\(status.status)")
+            }
+            try await Task.sleep(nanoseconds: 3_000_000_000)
+        }
+    }
+
+    @MainActor
+    private func finalizeServerBackedJob(jobId: UUID, outputs: [Data]) {
+        guard let job = JobStore.shared.jobs.first(where: { $0.id == jobId }) else { return }
+        guard !job.phase.isFinal else { return }
+
+        switch job.kind {
+        case .simpleImage, .storyRender:
+            guard let inputFiles = job.inputImageFiles else {
+                JobStore.shared.markTimeoutUnknown(jobId,
+                                                   message: "服务器任务已完成，但本地输入图快照已缺失，无法自动写入历史。",
+                                                   errorCode: "SERVER_RECOVERY_INPUT_MISSING")
+                return
+            }
+            let inputDatas = inputFiles.compactMap {
+                JobStore.shared.loadPendingImage($0, jobId: job.id)?.pngData()
+            }
+            guard !inputDatas.isEmpty else {
+                JobStore.shared.markTimeoutUnknown(jobId,
+                                                   message: "服务器任务已完成，但本地输入图快照已缺失，无法自动写入历史。",
+                                                   errorCode: "SERVER_RECOVERY_INPUT_MISSING")
+                return
+            }
+            let projectId = job.projectId ?? ProjectStore.shared.ensureDefaultProject().id
+            let saved = MangaStorage.shared.add(
+                projectId: projectId,
+                style: job.style,
+                inputs: inputDatas,
+                outputs: outputs,
+                userPrompt: job.userPromptText,
+                storyScript: job.storyScriptSnapshot,
+                previousPage: job.previousPageFile.flatMap {
+                    JobStore.shared.loadPendingImage($0, jobId: job.id)?.pngData()
+                },
+                loadedCharacterIds: job.characterIds,
+                loadedCharacterSelections: job.characterSelections,
+                bubbleTextMode: job.bubbleMode,
+                isColorOutput: job.wasColorOn,
+                imageCount: job.imageCount,
+                imageSize: job.imageSizeStr,
+                imageQuality: job.imageQualityStr
+            )
+            JobStore.shared.complete(job.id, with: saved.id)
+        case .characterViews:
+            guard let first = outputs.first,
+                  let characterId = job.characterId,
+                  let label = job.outputLabel ?? job.artStyle?.displayName else {
+                JobStore.shared.markTimeoutUnknown(jobId,
+                                                   message: "服务器任务已完成，但角色回写信息不完整。",
+                                                   errorCode: "SERVER_RECOVERY_CHARACTER_MISSING")
+                return
+            }
+            CharacterStore.shared.addViews(to: characterId, views: [(label, first)])
+            JobStore.shared.complete(job.id, with: characterId)
+        case .storyScript:
+            JobStore.shared.markTimeoutUnknown(jobId,
+                                               message: "编剧任务已在服务器完成，但当前版本不会自动恢复编辑界面。",
+                                               errorCode: "SERVER_RECOVERY_UNSUPPORTED")
+        }
+    }
+
+    private func fetchBackendTaskStatus(taskId: String) async throws -> BackendTaskStatus {
+        let config = try requireBackendConfig()
+        let req = try makeBackendRequest(config: config, path: "/api/tasks/\(taskId)")
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse else {
+            throw OpenAIError.unknown("Invalid backend response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let bodyString = String(data: data, encoding: .utf8) ?? "<binary>"
+            throw OpenAIError.requestFailed(status: http.statusCode, body: bodyString)
+        }
+        return try decodeJSON(BackendTaskStatus.self, from: data)
+    }
+
+    private func downloadBackendOutputs(taskId: String, outputCount: Int) async throws -> [Data] {
+        let config = try requireBackendConfig()
+        var outputs: [Data] = []
+        for index in 0..<outputCount {
+            let req = try makeBackendRequest(config: config,
+                                             path: "/api/tasks/\(taskId)/result?index=\(index)")
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                throw OpenAIError.unknown("Invalid backend response")
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                let bodyString = String(data: data, encoding: .utf8) ?? "<binary>"
+                throw OpenAIError.requestFailed(status: http.statusCode, body: bodyString)
+            }
+            outputs.append(data)
+        }
+        return outputs
+    }
+
+    private func cancelBackendTask(taskId: String, config: BackendConfig) async throws {
+        var req = try makeBackendRequest(config: config,
+                                         path: "/api/tasks/\(taskId)/cancel",
+                                         method: "POST")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data("{}".utf8)
+        _ = try await URLSession.shared.data(for: req)
+    }
+
+    private func makeMultipartRequest(
+        config: BackendConfig,
+        path: String,
+        fields: [(String, String)],
+        files: [(field: String, filename: String, mime: String, data: Data)]
+    ) throws -> (URLRequest, Data) {
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var body = Data()
+
+        for (name, value) in fields {
+            body.appendString("--\(boundary)\r\n")
+            body.appendString("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n")
+            body.appendString("\(value)\r\n")
+        }
+
+        for file in files {
+            body.appendString("--\(boundary)\r\n")
+            body.appendString("Content-Disposition: form-data; name=\"\(file.field)\"; filename=\"\(file.filename)\"\r\n")
+            body.appendString("Content-Type: \(file.mime)\r\n\r\n")
+            body.append(file.data)
+            body.appendString("\r\n")
+        }
+
+        body.appendString("--\(boundary)--\r\n")
+
+        var req = try makeBackendRequest(config: config, path: path, method: "POST")
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        return (req, body)
+    }
+
+    private func makeBackendRequest(config: BackendConfig,
+                                    path: String,
+                                    method: String = "GET") throws -> URLRequest {
+        guard let url = URL(string: path, relativeTo: config.baseURL)?.absoluteURL else {
+            throw OpenAIError.unknown("后端地址无效：\(config.baseURL.absoluteString)")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.setValue(config.apiKey, forHTTPHeaderField: "X-API-Key")
+        req.timeoutInterval = 120
+        return req
+    }
+
+    private func decodeJSON<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        do {
+            return try JSONDecoder().decode(type, from: data)
+        } catch {
+            throw OpenAIError.unknown("后端返回解析失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func requireBackendConfig() throws -> BackendConfig {
+        guard let config = currentBackendConfig() else {
+            throw OpenAIError.missingAPIKey
+        }
+        return config
+    }
+
+    private func currentBackendConfig() -> BackendConfig? {
+        let rawURL = UserDefaults.standard.string(forKey: AppSettings.backendBaseURLKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = (rawURL?.isEmpty == false ? rawURL! : "https://manga.areu.pro")
+        guard let key = KeychainService.shared.loadBackendAPIKey(),
+              !key.isEmpty,
+              let url = URL(string: base) else {
+            return nil
+        }
+        return BackendConfig(baseURL: url, apiKey: key)
     }
 
     // MARK: ─────────────────────────────────────────────────────

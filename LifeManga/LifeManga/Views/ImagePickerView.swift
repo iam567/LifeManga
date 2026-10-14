@@ -12,7 +12,7 @@ import UIKit
 
 struct ImagePickerView: UIViewControllerRepresentable {
     var sourceType: UIImagePickerController.SourceType
-    var onImage: (UIImage) -> Void
+    var onImage: (UIImage, [UIImagePickerController.InfoKey: Any]) -> Void
     @Environment(\.dismiss) private var dismiss
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -34,7 +34,7 @@ struct ImagePickerView: UIViewControllerRepresentable {
         func imagePickerController(_ picker: UIImagePickerController,
                                    didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey : Any]) {
             if let img = info[.originalImage] as? UIImage {
-                parent.onImage(img)
+                parent.onImage(img, info)
             }
             parent.dismiss()
         }

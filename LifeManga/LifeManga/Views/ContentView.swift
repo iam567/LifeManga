@@ -29,19 +29,19 @@ struct ContentView: View {
             .tabItem { Label("发布", systemImage: "paperplane.fill") }
         }
         .overlay(alignment: .top) {
-            if !settings.hasAPIKey {
-                APIKeyMissingBanner()
+            if !settings.isBackendConfigured {
+                BackendConfigMissingBanner()
                     .padding(.top, 4)
             }
         }
     }
 }
 
-private struct APIKeyMissingBanner: View {
+private struct BackendConfigMissingBanner: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
-            Text("请先到「设置」配置 OpenAI API Key")
+            Text("请先到「设置」配置漫画后端地址和 API Key")
                 .font(.footnote)
             Spacer()
         }
@@ -61,6 +61,7 @@ struct ProjectListView: View {
 
     @State private var showNewSheet = false
     @State private var newName: String = ""
+    @State private var newMode: ProjectMode = .comicLife
     @State private var renamingProject: MangaProject?
     @State private var renameInput: String = ""
     @State private var showSettings = false
@@ -104,13 +105,20 @@ struct ProjectListView: View {
                 }
             }
         }
-        .alert("新建漫画工程", isPresented: $showNewSheet) {
-            TextField("工程名（如：东京游记 / 我的猫的一天）", text: $newName)
-            Button("创建") {
-                store.create(name: newName.trimmingCharacters(in: .whitespaces))
+        .sheet(isPresented: $showNewSheet) {
+            CreateProjectSheet(name: $newName, mode: $newMode) {
+                store.create(
+                    name: newName.trimmingCharacters(in: .whitespaces),
+                    mode: newMode
+                )
                 newName = ""
+                newMode = .comicLife
+                showNewSheet = false
+            } onCancel: {
+                newName = ""
+                newMode = .comicLife
+                showNewSheet = false
             }
-            Button("取消", role: .cancel) { newName = "" }
         }
         .alert("重命名工程", isPresented: .init(
             get: { renamingProject != nil },
@@ -134,6 +142,7 @@ struct ProjectListView: View {
 
     private func startNewProject() {
         newName = ""
+        newMode = .comicLife
         showNewSheet = true
     }
 
@@ -220,6 +229,9 @@ private struct ProjectRow: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(project.name).font(.headline)
+                Label(project.mode.displayName, systemImage: project.mode.symbolName)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(project.mode == .navigationGuide ? .green : .indigo)
                 HStack(spacing: 8) {
                     Text("\(itemCount) 张")
                     Text("·")
@@ -230,6 +242,93 @@ private struct ProjectRow: View {
             }
         }
         .padding(.vertical, 2)
+    }
+}
+
+private struct CreateProjectSheet: View {
+    @Binding var name: String
+    @Binding var mode: ProjectMode
+    let onCreate: () -> Void
+    let onCancel: () -> Void
+
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    nameSection
+                    modeSection
+                }
+                .padding()
+            }
+            .navigationTitle("新建漫画工程")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("取消", action: onCancel)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("创建", action: onCreate)
+                        .disabled(trimmedName.isEmpty)
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private var nameSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("工程名")
+                .font(.headline)
+            TextField("如：东京游记 / 找咖啡店 / 我的猫的一天", text: $name)
+                .textFieldStyle(.roundedBorder)
+        }
+    }
+
+    private var modeSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("工程模式")
+                .font(.headline)
+            VStack(spacing: 12) {
+                ForEach(ProjectMode.allCases) { option in
+                    modeCard(option)
+                }
+            }
+        }
+    }
+
+    private func modeCard(_ option: ProjectMode) -> some View {
+        let selected = mode == option
+        return Button {
+            mode = option
+        } label: {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: option.symbolName)
+                    .font(.title3)
+                    .foregroundStyle(selected ? .white : .indigo)
+                    .frame(width: 28)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(option.displayName)
+                        .font(.headline)
+                        .foregroundStyle(selected ? .white : .primary)
+                    Text(option.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(selected ? .white.opacity(0.9) : .secondary)
+                }
+                Spacer()
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(selected ? .white : Color.secondary.opacity(0.6))
+            }
+            .padding(14)
+            .background(
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(selected ? Color.indigo : Color(.systemGray6))
+            )
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -249,7 +348,7 @@ struct ProjectShellView: View {
         VStack(spacing: 0) {
             Picker("", selection: $section) {
                 ForEach(Section.allCases) { s in
-                    Text(s.rawValue).tag(s)
+                    Text(sectionTitle(for: s)).tag(s)
                 }
             }
             .pickerStyle(.segmented)
@@ -266,6 +365,15 @@ struct ProjectShellView: View {
         }
         .navigationTitle(project.name)
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func sectionTitle(for section: Section) -> String {
+        switch (project.mode, section) {
+        case (.navigationGuide, .create):
+            return "导览"
+        default:
+            return section.rawValue
+        }
     }
 }
 
@@ -453,45 +561,69 @@ struct TaskManagerView: View {
         let cName = c.name
         let bio = c.bio
 
-        // 标签：算上之前已成功的同风格设定稿数量
-        let existingSameStyle = c.views.filter { $0.label.hasPrefix(artStyle.displayName) }.count
-        let label: String = existingSameStyle == 0
-            ? artStyle.displayName
-            : "\(artStyle.displayName) \(existingSameStyle + 1)"
+        let isAdvancedSheet = job.outputLabel?.contains("高级设定图") == true
+        let label: String = {
+            if isAdvancedSheet {
+                return artStyle.nextAdvancedSheetLabel(existingLabels: c.views.map(\.label))
+            }
+            return artStyle.standardPortraitLabel
+        }()
 
         let newJobId = JobStore.shared.startJob(
             style: settings.defaultStyle,
             kind: .characterViews,
             stageMessage: "已加入后台队列…（重试）",
-            subtitle: "\(artStyle.displayName)·\(cName)",
+            subtitle: "\(artStyle.displayName)·\(cName)·" + (isAdvancedSheet ? "高级设定图" : "标准立绘"),
             characterId: cId,
             characterName: cName,
             artStyle: artStyle,
+            outputLabel: label,
             manualRetryCount: job.manualRetryCount + 1
         )
 
         let task = Task {
             do {
-                // 不再 withDeadline 砍——交给 URLSession 自身超时（600s）
-                let data = try await OpenAIService.shared.generateCharacterSheet(
-                    sourcePhoto: img,
-                    name: cName,
-                    bio: bio,
-                    artStyle: artStyle,
-                    size: imgSize,
-                    quality: imgQuality,
-                    jobId: newJobId,
-                    onStage: { msg in JobStore.shared.updateStage(newJobId, msg) }
-                )
+                let data: Data
+                if isAdvancedSheet {
+                    let basePortrait = c.views.first(where: { $0.label == artStyle.standardPortraitLabel })
+                        .flatMap { characterStore.image(named: $0.imageName) }
+                    data = try await OpenAIService.shared.generateAdvancedCharacterSheet(
+                        sourcePhoto: img,
+                        basePortrait: basePortrait,
+                        name: cName,
+                        bio: bio,
+                        ageGroup: c.ageGroup,
+                        gender: c.gender,
+                        artStyle: artStyle,
+                        size: imgSize,
+                        quality: imgQuality,
+                        jobId: newJobId,
+                        onStage: { msg in JobStore.shared.updateStage(newJobId, msg) }
+                    )
+                } else {
+                    data = try await OpenAIService.shared.generateCharacterPortrait(
+                        sourcePhoto: img,
+                        name: cName,
+                        bio: bio,
+                        ageGroup: c.ageGroup,
+                        gender: c.gender,
+                        artStyle: artStyle,
+                        size: imgSize,
+                        quality: imgQuality,
+                        jobId: newJobId,
+                        onStage: { msg in JobStore.shared.updateStage(newJobId, msg) }
+                    )
+                }
                 if Task.isCancelled { return }
                 CharacterStore.shared.addViews(to: cId, views: [(label, data)])
                 JobStore.shared.complete(newJobId, with: cId)
                 LocalNotifier.notifyDone(
-                    title: "「\(artStyle.displayName)」设定稿完成",
+                    title: "「\(artStyle.displayName)」" + (isAdvancedSheet ? "高级设定图完成" : "标准立绘完成"),
                     body: cName
                 )
             } catch {
-                await resolveJobError(error, jobId: newJobId, label: artStyle.displayName)
+                resolveJobError(error, jobId: newJobId,
+                                label: "\(artStyle.displayName) " + (isAdvancedSheet ? "高级设定图" : "标准立绘"))
             }
         }
         JobStore.shared.attachTask(task, to: newJobId)
@@ -519,8 +651,14 @@ struct TaskManagerView: View {
             guard let c = characterStore.characters.first(where: { $0.id == cid }) else {
                 return nil
             }
-            let v = c.views.first(where: { $0.label == "正面" }) ?? c.views.first
-            if let n = v?.imageName, let ui = characterStore.image(named: n) {
+            let selectedViewId = job.characterSelections?.first(where: { $0.characterId == cid })?.viewId
+            if let selectedViewId,
+               let view = c.views.first(where: { $0.id == selectedViewId }),
+               let ui = characterStore.image(named: view.imageName) {
+                return ui
+            }
+            if let n = c.preferredCoverView?.imageName,
+               let ui = characterStore.image(named: n) {
                 return ui
             }
             if let n = c.sourcePhotoName, let ui = characterStore.image(named: n) {
@@ -550,13 +688,19 @@ struct TaskManagerView: View {
         let style = job.style
         let projectId = job.projectId
         let projectName = job.projectName
+        let preserveRealWorldReadability = ProjectStore.shared.projects
+            .first(where: { $0.id == projectId })?.mode == .navigationGuide
 
         let req = OpenAIImageRequest(
             inputImages: inputImages,
             previousPageImage: prevImage,
             characterReferenceImages: charImages,
             characterDirective: charDirective,
-            stylePrompt: style.effectivePrompt(isColor: isColor),
+            stylePrompt: style.effectivePrompt(
+                isColor: isColor,
+                stylizationStrength: settings.mangaStylizationStrength,
+                preserveRealWorldReadability: preserveRealWorldReadability
+            ),
             userPrompt: userPrompt,
             n: n,
             size: imgSize,
@@ -581,6 +725,7 @@ struct TaskManagerView: View {
             inputImageFiles: pending.inputs,
             previousPageFile: pending.previous,
             characterIds: job.characterIds,
+            characterSelections: job.characterSelections,
             userPromptText: userPrompt,
             bubbleMode: bubbleMode,
             wasColorOn: isColor,
@@ -605,7 +750,15 @@ struct TaskManagerView: View {
                     inputs: inputDatas,
                     outputs: datas,
                     userPrompt: userPrompt,
-                    storyScript: nil
+                    storyScript: nil,
+                    previousPage: prevImage?.pngData(),
+                    loadedCharacterIds: job.characterIds,
+                    loadedCharacterSelections: job.characterSelections,
+                    bubbleTextMode: bubbleMode,
+                    isColorOutput: isColor,
+                    imageCount: n,
+                    imageSize: imgSize,
+                    imageQuality: imgQuality
                 )
                 JobStore.shared.complete(newJobId, with: savedItem.id)
                 LocalNotifier.notifyDone(
@@ -613,7 +766,7 @@ struct TaskManagerView: View {
                     body: "\(projectName)：\(style.displayName) · 共 \(savedItem.outputImageNames.count) 张"
                 )
             } catch {
-                await resolveJobError(error, jobId: newJobId)
+                resolveJobError(error, jobId: newJobId)
             }
         }
         JobStore.shared.attachTask(task, to: newJobId)
@@ -844,7 +997,7 @@ private struct JobRow: View {
             ZStack {
                 if job.kind == .characterViews {
                     if let c = characterStore.characters.first(where: { $0.id == resultId }),
-                       let v = c.views.first(where: { $0.label == "正面" }) ?? c.views.first,
+                       let v = c.preferredCoverView,
                        let img = characterStore.image(named: v.imageName) {
                         Image(uiImage: img)
                             .resizable().scaledToFill()
@@ -919,6 +1072,8 @@ private struct JobRow: View {
 struct CharacterLibraryView: View {
     @ObservedObject private var store = CharacterStore.shared
     @State private var showCreate = false
+    @State private var isSyncing = false
+    @State private var syncMessage: String?
 
     private let columns = [GridItem(.adaptive(minimum: 150), spacing: 12)]
 
@@ -933,8 +1088,22 @@ struct CharacterLibraryView: View {
         .navigationTitle("角色库")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button { showCreate = true } label: {
-                    Image(systemName: "plus.circle.fill").font(.title3)
+                HStack(spacing: 10) {
+                    Button {
+                        syncCharacters()
+                    } label: {
+                        if isSyncing {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90.icloud.fill")
+                                .font(.title3)
+                        }
+                    }
+                    .disabled(isSyncing || store.characters.isEmpty)
+
+                    Button { showCreate = true } label: {
+                        Image(systemName: "plus.circle.fill").font(.title3)
+                    }
                 }
             }
         }
@@ -944,6 +1113,14 @@ struct CharacterLibraryView: View {
         .navigationDestination(for: Character.self) { c in
             CharacterDetailView(character: c)
         }
+        .alert("角色库同步", isPresented: Binding(
+            get: { syncMessage != nil },
+            set: { if !$0 { syncMessage = nil } }
+        )) {
+            Button("好") { syncMessage = nil }
+        } message: {
+            Text(syncMessage ?? "")
+        }
     }
 
     private var empty: some View {
@@ -952,7 +1129,7 @@ struct CharacterLibraryView: View {
                 .font(.system(size: 56))
                 .foregroundStyle(.indigo.opacity(0.6))
             Text("还没有角色").font(.title3.weight(.semibold))
-            Text("用一张真人照片，让 AI 生成一张完整的角色设定稿（含主体姿势、表情研究、服装/配饰/物品全套），\n之后可以载入到任意工程里画进剧情。")
+            Text("用一张真人照片，先生成干净的标准立绘；\n之后再按不同艺术风格继续扩展成高级设定图、动作合集和剧情参考。")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -980,6 +1157,23 @@ struct CharacterLibraryView: View {
             .padding()
         }
     }
+
+    private func syncCharacters() {
+        isSyncing = true
+        Task {
+            defer { Task { @MainActor in isSyncing = false } }
+            do {
+                let count = try await CharacterSyncService.shared.syncAllCharacters()
+                await MainActor.run {
+                    syncMessage = "已同步 \(count) 个角色到服务器后台。"
+                }
+            } catch {
+                await MainActor.run {
+                    syncMessage = error.localizedDescription
+                }
+            }
+        }
+    }
 }
 
 private struct CharacterCardView: View {
@@ -987,7 +1181,7 @@ private struct CharacterCardView: View {
     @ObservedObject private var store = CharacterStore.shared
 
     private var coverImage: UIImage? {
-        if let v = character.views.first {
+        if let v = character.preferredCoverView {
             return store.image(named: v.imageName)
         }
         if let n = character.sourcePhotoName {
@@ -1015,7 +1209,7 @@ private struct CharacterCardView: View {
             .clipShape(RoundedRectangle(cornerRadius: 12))
 
             Text(character.name).font(.subheadline.weight(.medium)).lineLimit(1)
-            Text("\(character.views.count) 张立绘")
+            Text("\(character.views.count) 张角色资产")
                 .font(.caption2).foregroundStyle(.secondary)
         }
     }
@@ -1026,7 +1220,7 @@ struct CharacterDetailView: View {
     let character: Character
     @ObservedObject private var store = CharacterStore.shared
     @Environment(\.dismiss) private var dismiss
-    @State private var showAddViews = false
+    @State private var showAdvancedSheet = false
     @State private var showPosePicker = false
     @State private var zoomingView: CharacterView?
     @State private var showRename = false
@@ -1059,9 +1253,9 @@ struct CharacterDetailView: View {
                     .buttonStyle(.borderedProminent)
 
                     Button {
-                        showAddViews = true
+                        showAdvancedSheet = true
                     } label: {
-                        Label("再生成一张设定稿", systemImage: "photo.badge.plus")
+                        Label("生成高级设定图", systemImage: "square.grid.3x3.topleft.filled")
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 8)
                     }
@@ -1070,7 +1264,7 @@ struct CharacterDetailView: View {
                 .padding(.horizontal)
 
                 if current.views.isEmpty {
-                    Text("还没有立绘。设定稿生成中？去任务面板看看进度。")
+                    Text("还没有角色资产。标准立绘生成中？去任务面板看看进度。")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity)
@@ -1140,8 +1334,8 @@ struct CharacterDetailView: View {
             }
             Button("取消", role: .cancel) {}
         }
-        .sheet(isPresented: $showAddViews) {
-            CharacterCreateView(existingCharacterId: current.id)
+        .sheet(isPresented: $showAdvancedSheet) {
+            AdvancedCharacterSheetView(character: current)
         }
         .sheet(isPresented: $showPosePicker) {
             PosePickerSheet(character: current)
@@ -1252,41 +1446,131 @@ struct PosePickerSheet: View {
     let character: Character
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var settings: AppSettings
-    @State private var selected: Set<String> = []  // 用 label 作为 key
+    @State private var selected: Set<String> = []
+    @State private var selectedReferenceViewID: UUID?
 
     private let columns = [GridItem(.adaptive(minimum: 100), spacing: 8)]
 
-    private var allPoses: [(group: String, pose: OpenAIService.CharacterViewSpec)] {
+    private struct PoseOption {
+        let id: String
+        let pose: OpenAIService.CharacterViewSpec
+    }
+
+    private var allPoses: [PoseOption] {
         OpenAIService.extendedPoseGroups.flatMap { g in
-            g.poses.map { (g.title, $0) }
+            g.poses.map { PoseOption(id: "\(g.id)::\($0.label)", pose: $0) }
         }
     }
 
     private var pickedSpecs: [OpenAIService.CharacterViewSpec] {
-        allPoses.filter { selected.contains($0.pose.label) }.map { $0.pose }
+        allPoses.filter { selected.contains($0.id) }.map(\.pose)
+    }
+
+    private var standardPortraitViews: [CharacterView] {
+        character.views
+            .filter(\.isStandardPortrait)
+            .sorted { lhs, rhs in
+                if lhs.createdAt == rhs.createdAt {
+                    return lhs.label < rhs.label
+                }
+                return lhs.createdAt < rhs.createdAt
+            }
+    }
+
+    private var selectedReferenceView: CharacterView? {
+        if let selectedReferenceViewID,
+           let view = standardPortraitViews.first(where: { $0.id == selectedReferenceViewID }) {
+            return view
+        }
+        return standardPortraitViews.first
     }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("勾选要生成的动作 / 镜头，所有勾选的会被合成到一张图里。")
+                    Text("先选一张标准立绘做主参考，再勾选要生成的动作 / 镜头。所有勾选动作会被合成到一张全彩动作图里。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal)
+
+                    if let hero = selectedReferenceView,
+                       let image = CharacterStore.shared.image(named: hero.imageName) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("当前主参考")
+                                .font(.subheadline.bold())
+                                .padding(.horizontal)
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(maxHeight: 220)
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                                .padding(.horizontal)
+                            Text(hero.label)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal)
+                        }
+                    }
+
+                    if !standardPortraitViews.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("切换参考图")
+                                .font(.subheadline.bold())
+                                .padding(.horizontal)
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 12) {
+                                    ForEach(standardPortraitViews) { view in
+                                        if let image = CharacterStore.shared.image(named: view.imageName) {
+                                            Button {
+                                                selectedReferenceViewID = view.id
+                                            } label: {
+                                                VStack(alignment: .leading, spacing: 8) {
+                                                    Image(uiImage: image)
+                                                        .resizable()
+                                                        .scaledToFill()
+                                                        .frame(width: 110, height: 146)
+                                                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                                                        .overlay(
+                                                            RoundedRectangle(cornerRadius: 12)
+                                                                .stroke(
+                                                                    selectedReferenceView?.id == view.id
+                                                                    ? Color.accentColor
+                                                                    : Color.gray.opacity(0.2),
+                                                                    lineWidth: selectedReferenceView?.id == view.id ? 3 : 1
+                                                                )
+                                                        )
+                                                    Text(view.label)
+                                                        .font(.caption2.weight(.medium))
+                                                        .foregroundStyle(.primary)
+                                                        .lineLimit(2)
+                                                }
+                                                .frame(width: 110, alignment: .leading)
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                }
+                                .padding(.horizontal)
+                                .padding(.vertical, 4)
+                            }
+                        }
+                    }
 
                     ForEach(OpenAIService.extendedPoseGroups) { group in
                         VStack(alignment: .leading, spacing: 8) {
                             Text(group.title).font(.subheadline.bold())
                                 .padding(.horizontal)
                             LazyVGrid(columns: columns, spacing: 8) {
-                                ForEach(group.poses, id: \.label) { p in
+                                ForEach(group.poses.indices, id: \.self) { idx in
+                                    let p = group.poses[idx]
+                                    let optionId = "\(group.id)::\(p.label)"
                                     PoseChip(label: p.label,
-                                             selected: selected.contains(p.label)) {
-                                        if selected.contains(p.label) {
-                                            selected.remove(p.label)
+                                             selected: selected.contains(optionId)) {
+                                        if selected.contains(optionId) {
+                                            selected.remove(optionId)
                                         } else {
-                                            selected.insert(p.label)
+                                            selected.insert(optionId)
                                         }
                                     }
                                 }
@@ -1312,11 +1596,16 @@ struct PosePickerSheet: View {
                     .disabled(selected.isEmpty)
                 }
             }
+            .onAppear {
+                if selectedReferenceViewID == nil {
+                    selectedReferenceViewID = standardPortraitViews.first?.id
+                }
+            }
             .safeAreaInset(edge: .bottom) {
                 if !selected.isEmpty {
                     HStack {
                         Image(systemName: "moon.zzz.fill")
-                        Text("会立刻关闭，AI 在后台把 \(selected.count) 个动作合成到一张图（约 1~3 分钟）")
+                        Text("会立刻关闭，AI 在后台按当前参考图风格生成 1 张全彩动作图（含 \(selected.count) 个动作，约 1~3 分钟）")
                             .font(.caption)
                     }
                     .padding()
@@ -1332,16 +1621,18 @@ struct PosePickerSheet: View {
         guard !specs.isEmpty else { return }
 
         let sourceImage: UIImage? = {
+            if let v = selectedReferenceView,
+               let img = CharacterStore.shared.image(named: v.imageName) { return img }
             if let n = character.sourcePhotoName,
                let img = CharacterStore.shared.image(named: n) { return img }
-            if let v = character.views.first,
+            if let v = character.preferredCoverView,
                let img = CharacterStore.shared.image(named: v.imageName) { return img }
             return nil
         }()
         guard let src = sourceImage else { return }
 
         let style = settings.defaultStyle
-        let isColor = settings.isColor
+        let isColor = true
         let cId = character.id
         let cName = character.name
 
@@ -1357,9 +1648,10 @@ struct PosePickerSheet: View {
             style: style,
             kind: .characterViews,
             stageMessage: "已加入后台队列…",
-            subtitle: "\(specs.count) 个动作合集 · \(cName)",
+            subtitle: "\(specs.count) 个动作合集 · \(cName) · 全彩",
             characterId: cId,
-            characterName: cName
+            characterName: cName,
+            outputLabel: label
         )
 
         dismiss()
@@ -1370,6 +1662,8 @@ struct PosePickerSheet: View {
                     sourcePhoto: src,
                     name: cName,
                     bio: character.bio,
+                    ageGroup: character.ageGroup,
+                    gender: character.gender,
                     specs: specs,
                     style: style,
                     isColor: isColor,
@@ -1389,7 +1683,7 @@ struct PosePickerSheet: View {
                     body: "\(cName) · \(specs.count) 个动作"
                 )
             } catch {
-                await resolveJobError(error, jobId: jobId, label: "动作合集")
+                resolveJobError(error, jobId: jobId, label: "动作合集")
             }
         }
         JobStore.shared.attachTask(task, to: jobId)
@@ -1421,39 +1715,54 @@ private struct PoseChip: View {
     }
 }
 
-// 创建 / 增加视图
+// 创建角色：先生成标准立绘
 struct CharacterCreateView: View {
     @EnvironmentObject var settings: AppSettings
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var store = CharacterStore.shared
 
-    /// 若非 nil，则是为已有角色追加视图（不会再创建新角色）
-    var existingCharacterId: UUID?
-
     @State private var name = ""
     @State private var bio = ""
+    @State private var ageGroup: CharacterAgeGroup = .youngAdult
+    @State private var gender: CharacterGender = .male
     @State private var photo: UIImage?
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var selectedStyles: Set<CharacterArtStyle> = [.jpAnime]
-    @State private var didAutoloadPhoto = false
 
-    private var isAppending: Bool { existingCharacterId != nil }
     private let styleColumns = [GridItem(.adaptive(minimum: 110), spacing: 8)]
 
-    private var existingCharacter: Character? {
-        guard let id = existingCharacterId else { return nil }
-        return store.characters.first { $0.id == id }
+    private var referencePhotoHint: String {
+        var lines: [String] = []
+        lines.append("📸 照片小贴士：")
+        if ageGroup.isMinor {
+            lines.append("• 你当前选的是「\(ageGroup.displayName)」：OpenAI 对真人儿童照片非常敏感，可能直接拦截，或者生成结果不稳定。")
+            lines.append("• 这个年龄档位更适合作为角色设定信息，不能保证真人宝宝/儿童照片一定能成功转成角色。")
+        } else {
+            lines.append("• 半身或全身效果 > 大头自拍（V 字脸自拍角度容易被误判年龄）")
+            lines.append("• 正常表情 > 卖萌 / 鬼脸")
+            lines.append("• 光线清楚、面部正面或 3/4 角度最好")
+        }
+        return lines.joined(separator: "\n")
     }
 
     var body: some View {
         NavigationStack {
             Form {
-                if !isAppending {
-                    Section("角色信息") {
-                        TextField("名字（如：小明）", text: $name)
-                        TextField("一句话设定（性格/身份）", text: $bio, axis: .vertical)
-                            .lineLimit(2...4)
+                Section("角色信息") {
+                    TextField("名字（如：小明）", text: $name)
+                    TextField("一句话设定（性格/身份）", text: $bio, axis: .vertical)
+                        .lineLimit(2...4)
+                    Picker("角色类型", selection: $ageGroup) {
+                        ForEach(CharacterAgeGroup.allCases) { group in
+                            Text(group.displayName).tag(group)
+                        }
                     }
+                    Picker("性别", selection: $gender) {
+                        ForEach(CharacterGender.allCases) { option in
+                            Text(option.displayName).tag(option)
+                        }
+                    }
+                    .pickerStyle(.segmented)
                 }
                 Section {
                     if let img = photo {
@@ -1463,35 +1772,19 @@ struct CharacterCreateView: View {
                             .frame(maxHeight: 240)
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                     }
-                    if !isAppending {
-                        // 新建角色：必须选照片
-                        PhotosPicker(selection: $pickerItems,
-                                     maxSelectionCount: 1,
-                                     matching: .images) {
-                            Label(photo == nil ? "选一张照片" : "更换照片",
-                                  systemImage: "photo.on.rectangle")
-                        }
-                    } else {
-                        // 已有角色追加：默认用原图
-                        Text("正在使用这个角色最初的参考照（保持画面一致）")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        PhotosPicker(selection: $pickerItems,
-                                     maxSelectionCount: 1,
-                                     matching: .images) {
-                            Label("换张参考照", systemImage: "arrow.triangle.2.circlepath")
-                                .font(.caption)
-                        }
+                    PhotosPicker(selection: $pickerItems,
+                                 maxSelectionCount: 1,
+                                 matching: .images) {
+                        Label(photo == nil ? "选一张照片" : "更换照片",
+                              systemImage: "photo.on.rectangle")
                     }
                 } header: {
-                    Text(isAppending ? "参考照片（用原照片）" : "参考照片（必选）")
+                    Text("参考照片（必选）")
                 } footer: {
-                    if !isAppending {
-                        Text("📸 照片小贴士：\n• 必须是成年人 —— OpenAI 禁止用真人小孩照片\n• 半身或全身效果 > 大头自拍（V 字脸自拍角度容易被误判为儿童）\n• 正常表情 > 卖萌 / 鬼脸\n• 光线清楚、面部正面或 3/4 角度最好")
-                            .font(.caption2)
-                    }
+                    Text(referencePhotoHint)
+                        .font(.caption2)
                 }
-                Section("艺术风格（可多选，每选一个会单独生成一张设定稿）") {
+                Section("艺术风格（可多选，每选一个会单独生成一张标准立绘）") {
                     LazyVGrid(columns: styleColumns, spacing: 8) {
                         ForEach(CharacterArtStyle.allCases) { s in
                             ArtStyleChip(
@@ -1510,13 +1803,13 @@ struct CharacterCreateView: View {
                     .listRowInsets(EdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8))
                 }
                 Section {
-                    Label("点击「生成」立刻关闭窗口，AI 在后台并行生成 \(selectedStyles.count) 张设定稿（每张约 2~3 分钟，含主体/表情/服装/配饰/双语标注）。完成后会推送通知。",
+                    Label("点击「生成」立刻关闭窗口，AI 会先为每个所选艺术风格生成一张白背景彩色标准立绘。后续在角色详情页里还能继续生成高级设定图和动作合集。",
                           systemImage: "moon.zzz.fill")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle(isAppending ? "追加视图" : "新建角色")
+            .navigationTitle("新建角色")
             .navigationBarTitleDisplayMode(.inline)
             .onChange(of: pickerItems) { _, items in
                 Task {
@@ -1528,15 +1821,6 @@ struct CharacterCreateView: View {
                     pickerItems = []
                 }
             }
-            .onAppear {
-                // isAppending 时自动加载该角色的原照片
-                if !didAutoloadPhoto, isAppending, photo == nil,
-                   let n = existingCharacter?.sourcePhotoName,
-                   let img = CharacterStore.shared.image(named: n) {
-                    photo = img
-                    didAutoloadPhoto = true
-                }
-            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("取消") { dismiss() }
@@ -1546,120 +1830,86 @@ struct CharacterCreateView: View {
                         submit()
                     }
                     .disabled(photo == nil || selectedStyles.isEmpty ||
-                              (!isAppending && name.trimmingCharacters(in: .whitespaces).isEmpty))
+                              name.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
         }
     }
 
     /// 把生成任务提交到后台，立即关闭弹窗。
-    /// 多风格 → 串行执行（避免并发把自己堵死，也避免 OpenAI 把自己 key 限速）
+    /// 多风格 → 逐个独立提交到后端队列，这样锁屏后也不依赖本地串行调度继续往下发。
     private func submit() {
         guard let img = photo else { return }
         guard !selectedStyles.isEmpty else { return }
 
-        // 1. 先建好（或拿到）Character
-        let characterId: UUID
-        let characterName: String
-        if let existing = existingCharacterId,
-           let c = store.characters.first(where: { $0.id == existing }) {
-            characterId = c.id
-            characterName = c.name
-        } else {
-            let c = store.create(name: name,
-                                 bio: bio.isEmpty ? nil : bio,
-                                 sourcePhoto: img.pngData())
-            characterId = c.id
-            characterName = c.name
-        }
-
-        // 1024x1536 是 OpenAI 的"主路径"，单张反而比 1024x1024 便宜（$0.041 vs $0.053）
-        // 推测处理也更快（更优化）。回到这个尺寸让 OpenAI 走它最熟悉的渲染管线
+        let created = store.create(name: name,
+                                   bio: bio.isEmpty ? nil : bio,
+                                   ageGroup: ageGroup,
+                                   gender: gender,
+                                   sourcePhoto: img.pngData())
+        let characterId = created.id
+        let characterName = created.name
         let imgSize = "1024x1536"
         let imgQuality = "medium"
         let bioText = bio.isEmpty ? nil : bio
         let styles = Array(selectedStyles).sorted { $0.displayName < $1.displayName }
 
-        // 2. 一次性把所有 Job 加入队列（用户立即能在任务面板看到全部排队）
         var jobInfos: [(jobId: UUID, artStyle: CharacterArtStyle, label: String)] = []
-        for (idx, s) in styles.enumerated() {
-            let existingSameStyle = store.characters.first { $0.id == characterId }?
-                .views.filter { $0.label.hasPrefix(s.displayName) }.count ?? 0
-            let label: String = existingSameStyle == 0
-                ? s.displayName
-                : "\(s.displayName) \(existingSameStyle + 1)"
-
-            let queuePrefix = idx == 0 ? "即将开始…" : "排队中（前面还有 \(idx) 个）…"
-
+        for s in styles {
+            let label = s.standardPortraitLabel
             let jobId = JobStore.shared.startJob(
-                style: settings.defaultStyle,   // 仅用作 JobRow 兜底图标
+                style: settings.defaultStyle,
                 kind: .characterViews,
-                stageMessage: queuePrefix,
-                subtitle: "\(s.displayName)·\(characterName)",
+                stageMessage: "准备提交到服务器…",
+                subtitle: "\(s.displayName)·\(characterName)·标准立绘",
                 characterId: characterId,
                 characterName: characterName,
-                artStyle: s
+                artStyle: s,
+                outputLabel: label
             )
             jobInfos.append((jobId, s, label))
         }
 
-        // 3. 立刻关闭弹窗
         dismiss()
 
-        // 4. 用一个外层 Task 串行跑 —— 一次只一个 OpenAI 请求
-        let sessionTask = Task {
-            for (idx, info) in jobInfos.enumerated() {
-                if Task.isCancelled { break }
-                // 后续任务把"排队中"提示更新一下
-                if idx > 0 {
-                    JobStore.shared.updateStage(info.jobId, "前一个完成，准备开始…")
-                }
-                await runOneSheet(
+        for info in jobInfos {
+            let task = Task {
+                await runOnePortrait(
                     jobId: info.jobId,
                     characterId: characterId,
                     characterName: characterName,
                     bio: bioText,
+                    ageGroup: ageGroup,
+                    gender: gender,
                     photo: img,
                     artStyle: info.artStyle,
                     label: info.label,
                     size: imgSize,
                     quality: imgQuality
                 )
-                // 给后续 Job 更新排队序号
-                let remaining = jobInfos.count - idx - 1
-                if remaining > 0 {
-                    for (j, next) in jobInfos.enumerated()
-                    where j > idx && JobStore.shared.jobs.first(where: { $0.id == next.jobId })?.phase.isRunning == true {
-                        let ahead = j - idx - 1
-                        JobStore.shared.updateStage(
-                            next.jobId,
-                            ahead == 0 ? "即将开始…" : "排队中（前面还有 \(ahead) 个）…"
-                        )
-                    }
-                }
             }
-        }
-
-        // 5. 把这个 sessionTask 注册到所有 Job —— 用户取消任意一个 = 取消整批
-        for info in jobInfos {
-            JobStore.shared.attachTask(sessionTask, to: info.jobId)
+            JobStore.shared.attachTask(task, to: info.jobId)
         }
     }
 
-    private func runOneSheet(jobId: UUID,
-                             characterId: UUID,
-                             characterName: String,
-                             bio: String?,
-                             photo: UIImage,
-                             artStyle: CharacterArtStyle,
-                             label: String,
-                             size: String,
-                             quality: String) async {
+    private func runOnePortrait(jobId: UUID,
+                                characterId: UUID,
+                                characterName: String,
+                                bio: String?,
+                                ageGroup: CharacterAgeGroup,
+                                gender: CharacterGender,
+                                photo: UIImage,
+                                artStyle: CharacterArtStyle,
+                                label: String,
+                                size: String,
+                                quality: String) async {
         do {
-            let data = try await OpenAIService.shared.generateCharacterSheet(
+            let data = try await OpenAIService.shared.generateCharacterPortrait(
                 sourcePhoto: photo,
                 name: characterName,
                 bio: bio,
+                ageGroup: ageGroup,
+                gender: gender,
                 artStyle: artStyle,
                 size: size,
                 quality: quality,
@@ -1673,11 +1923,247 @@ struct CharacterCreateView: View {
             )
             JobStore.shared.complete(jobId, with: characterId)
             LocalNotifier.notifyDone(
-                title: "「\(artStyle.displayName)」设定稿完成",
+                title: "「\(artStyle.displayName)」标准立绘完成",
                 body: characterName
             )
         } catch {
-            await resolveJobError(error, jobId: jobId, label: artStyle.displayName)
+            resolveJobError(error, jobId: jobId, label: "\(artStyle.displayName) 标准立绘")
+        }
+    }
+}
+
+struct AdvancedCharacterSheetView: View {
+    let character: Character
+    @EnvironmentObject var settings: AppSettings
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var store = CharacterStore.shared
+    @State private var selectedStyles: Set<CharacterArtStyle> = [.jpAnime]
+    @State private var selectedReferenceViewID: UUID?
+
+    private let styleColumns = [GridItem(.adaptive(minimum: 110), spacing: 8)]
+
+    private var current: Character {
+        store.characters.first { $0.id == character.id } ?? character
+    }
+
+    private var sourcePhoto: UIImage? {
+        current.sourcePhotoName.flatMap { store.image(named: $0) }
+    }
+
+    private var standardPortraitViews: [CharacterView] {
+        current.views
+            .filter(\.isStandardPortrait)
+            .sorted { lhs, rhs in
+                if lhs.createdAt == rhs.createdAt {
+                    return lhs.label < rhs.label
+                }
+                return lhs.createdAt < rhs.createdAt
+            }
+    }
+
+    private var selectedReferenceView: CharacterView? {
+        if let selectedReferenceViewID,
+           let view = standardPortraitViews.first(where: { $0.id == selectedReferenceViewID }) {
+            return view
+        }
+        return standardPortraitViews.first
+    }
+
+    private func standardPortrait(for style: CharacterArtStyle) -> UIImage? {
+        guard let view = current.views.first(where: { $0.label == style.standardPortraitLabel }) else {
+            return nil
+        }
+        return store.image(named: view.imageName)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("生成逻辑") {
+                    Text("你可以先从这个角色已有的多张「标准立绘」里手动选一张做主参考；系统会优先使用这张主参考，再结合原始真人照片生成更复杂的高级设定图。")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let hero = selectedReferenceView,
+                   let image = store.image(named: hero.imageName) {
+                    Section("当前主参考") {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxHeight: 240)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        Text(hero.label)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if !standardPortraitViews.isEmpty {
+                    Section("切换主参考") {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 12) {
+                                ForEach(standardPortraitViews) { view in
+                                    if let image = store.image(named: view.imageName) {
+                                        Button {
+                                            selectedReferenceViewID = view.id
+                                        } label: {
+                                            VStack(alignment: .leading, spacing: 8) {
+                                                Image(uiImage: image)
+                                                    .resizable()
+                                                    .scaledToFill()
+                                                    .frame(width: 120, height: 160)
+                                                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                                                    .overlay(
+                                                        RoundedRectangle(cornerRadius: 12)
+                                                            .stroke(
+                                                                selectedReferenceViewID == view.id || (selectedReferenceViewID == nil && selectedReferenceView?.id == view.id)
+                                                                ? Color.accentColor
+                                                                : Color.gray.opacity(0.2),
+                                                                lineWidth: selectedReferenceViewID == view.id || (selectedReferenceViewID == nil && selectedReferenceView?.id == view.id)
+                                                                ? 3
+                                                                : 1
+                                                            )
+                                                    )
+
+                                                Text(view.label)
+                                                    .font(.caption2.weight(.medium))
+                                                    .foregroundStyle(.primary)
+                                                    .lineLimit(2)
+                                            }
+                                            .frame(width: 120, alignment: .leading)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+
+                Section("艺术风格（可多选，每选一个会单独生成一张高级设定图）") {
+                    LazyVGrid(columns: styleColumns, spacing: 8) {
+                        ForEach(CharacterArtStyle.allCases) { s in
+                            ArtStyleChip(style: s, selected: selectedStyles.contains(s)) {
+                                if selectedStyles.contains(s) {
+                                    selectedStyles.remove(s)
+                                } else {
+                                    selectedStyles.insert(s)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8))
+                }
+
+                Section {
+                    Label("高级设定图会比标准立绘复杂很多：主角色、表情区、服装拆解、生活物件、细节框和排版会一起生成，稳定性会稍低但信息量更高。",
+                          systemImage: "rectangle.grid.2x2")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("高级设定图")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(selectedStyles.count > 1 ? "生成 \(selectedStyles.count) 张" : "生成") {
+                        submit()
+                    }
+                    .disabled(sourcePhoto == nil || selectedStyles.isEmpty)
+                }
+            }
+            .onAppear {
+                if selectedReferenceViewID == nil {
+                    selectedReferenceViewID = standardPortraitViews.first?.id
+                }
+            }
+        }
+    }
+
+    private func submit() {
+        guard let sourcePhoto else { return }
+        let styles = Array(selectedStyles).sorted { $0.displayName < $1.displayName }
+        let imgSize = "1024x1536"
+        let imgQuality = "medium"
+        let bioText = current.bio
+        let chosenReferenceImage = selectedReferenceView.flatMap { store.image(named: $0.imageName) }
+
+        var jobInfos: [(jobId: UUID, artStyle: CharacterArtStyle, label: String)] = []
+        for style in styles {
+            let label = style.nextAdvancedSheetLabel(existingLabels: current.views.map(\.label))
+            let jobId = JobStore.shared.startJob(
+                style: settings.defaultStyle,
+                kind: .characterViews,
+                stageMessage: "准备提交到服务器…",
+                subtitle: "\(style.displayName)·\(current.name)·高级设定图",
+                characterId: current.id,
+                characterName: current.name,
+                artStyle: style,
+                outputLabel: label
+            )
+            jobInfos.append((jobId, style, label))
+        }
+
+        dismiss()
+
+        for info in jobInfos {
+            let task = Task {
+                await runOneAdvancedSheet(
+                    jobId: info.jobId,
+                    sourcePhoto: sourcePhoto,
+                    basePortrait: chosenReferenceImage ?? standardPortrait(for: info.artStyle),
+                    characterId: current.id,
+                    characterName: current.name,
+                    bio: bioText,
+                    artStyle: info.artStyle,
+                    label: info.label,
+                    size: imgSize,
+                    quality: imgQuality
+                )
+            }
+            JobStore.shared.attachTask(task, to: info.jobId)
+        }
+    }
+
+    private func runOneAdvancedSheet(jobId: UUID,
+                                     sourcePhoto: UIImage,
+                                     basePortrait: UIImage?,
+                                     characterId: UUID,
+                                     characterName: String,
+                                     bio: String?,
+                                     artStyle: CharacterArtStyle,
+                                     label: String,
+                                     size: String,
+                                     quality: String) async {
+        do {
+            let data = try await OpenAIService.shared.generateAdvancedCharacterSheet(
+                sourcePhoto: sourcePhoto,
+                basePortrait: basePortrait,
+                name: characterName,
+                bio: bio,
+                ageGroup: current.ageGroup,
+                gender: current.gender,
+                artStyle: artStyle,
+                size: size,
+                quality: quality,
+                jobId: jobId,
+                onStage: { msg in JobStore.shared.updateStage(jobId, msg) }
+            )
+            if Task.isCancelled { return }
+            CharacterStore.shared.addViews(to: characterId, views: [(label, data)])
+            JobStore.shared.complete(jobId, with: characterId)
+            LocalNotifier.notifyDone(
+                title: "「\(artStyle.displayName)」高级设定图完成",
+                body: characterName
+            )
+        } catch {
+            resolveJobError(error, jobId: jobId, label: "\(artStyle.displayName) 高级设定图")
         }
     }
 }

@@ -2,7 +2,7 @@
 //  SettingsView.swift
 //  LifeManga
 //
-//  - OpenAI API Key 配置（保存到 Keychain）
+//  - VPS 后端地址 / API Key 配置（Key 保存到 Keychain）
 //  - 默认漫画风格选择
 //  - 生成参数（数量、分辨率、质量）
 //
@@ -12,42 +12,48 @@ import SwiftUI
 struct SettingsView: View {
 
     @EnvironmentObject var settings: AppSettings
-    @State private var apiKeyInput: String = ""
+    @State private var backendURLInput: String = ""
+    @State private var backendKeyInput: String = ""
     @State private var showSavedToast = false
 
     var body: some View {
         NavigationStack {
             Form {
 
-                // MARK: API Key
+                // MARK: Backend
                 Section {
-                    SecureField(settings.hasAPIKey ? "已配置（输入新值可覆盖）" : "sk-...",
-                                text: $apiKeyInput)
+                    TextField("https://manga.areu.pro", text: $backendURLInput)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+
+                    TextField("后端 API Key", text: $backendKeyInput)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
 
                     HStack {
                         Button {
-                            saveKey()
+                            saveBackendConfig()
                         } label: {
-                            Label("保存到 Keychain", systemImage: "key.fill")
+                            Label("保存后端配置", systemImage: "externaldrive.badge.checkmark")
                         }
-                        .disabled(apiKeyInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .disabled(backendURLInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+                                  backendKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         Spacer()
-                        if settings.hasAPIKey {
+                        if settings.hasBackendAPIKey {
                             Button(role: .destructive) {
-                                KeychainService.shared.deleteAPIKey()
-                                settings.refreshAPIKeyStatus()
-                                apiKeyInput = ""
+                                KeychainService.shared.deleteBackendAPIKey()
+                                settings.refreshBackendStatus()
+                                backendKeyInput = ""
                             } label: {
-                                Text("清除").font(.subheadline)
+                                Text("清除 Key").font(.subheadline)
                             }
                         }
                     }
                 } header: {
-                    Text("OpenAI API Key")
+                    Text("漫画后端")
                 } footer: {
-                    Text("Key 仅保存在你这台设备的 iOS Keychain 里，不会上传到任何地方。在 platform.openai.com 中可以申请。")
+                    Text("这里填你的 VPS 后端地址和后端 API Key。Key 只保存在这台设备的 iOS Keychain 里；真正的 OpenAI Key 只放在你的服务器上，不再放在手机端。")
                 }
 
                 // MARK: 默认风格
@@ -105,6 +111,30 @@ struct SettingsView: View {
                     Text("主页可以随时切换，这里只是设定默认值。")
                 }
 
+                Section {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("漫画感强度")
+                            Spacer()
+                            Text(settings.mangaStylizationLabel)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $settings.mangaStylizationStrength, in: 0...1, step: 0.05)
+                        HStack {
+                            Text("偏实景")
+                            Spacer()
+                            Text("偏漫画")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("漫画感")
+                } footer: {
+                    Text("控制“照片参考”到“漫画重绘”的力度。漫画人生适合偏高；导航案内建议偏低，这样更容易保留道路、地标、招牌和可识别场景。")
+                }
+
                 // MARK: 对话框
                 Section {
                     Picker("对话框模式", selection: $settings.bubbleTextMode) {
@@ -115,7 +145,7 @@ struct SettingsView: View {
                 } header: {
                     Text("对话框")
                 } footer: {
-                    Text("普通模式 + 故事模式都生效。\n• 中文：气泡里画中文台词（推荐）\n• 日文假名：怀旧 manga 感，故事模式下剧本仍是中文\n• 英文：海外漫画风\n• 留空：画出气泡造型但不写字\n• 无对话框：完全不画对话框，纯视觉漫画")
+                    Text("普通模式 + 故事模式都生效。\n• 中文：气泡里画中文台词（推荐）\n• 日语：气泡里画日语台词，允许汉字和假名\n• 英文：海外漫画风\n• 留空：画出气泡造型但不写字\n• 无对话框：完全不画对话框，纯视觉漫画")
                 }
 
                 // MARK: 故事模式
@@ -138,11 +168,19 @@ struct SettingsView: View {
                 // MARK: 关于
                 Section("关于") {
                     LabeledContent("App 名称", value: "漫画人生")
-                    LabeledContent("模型", value: "gpt-image-2")
+                    LabeledContent("图片模型", value: "gpt-image-2（服务端调用）")
                     LabeledContent("版本", value: "1.0.0")
-                    Link(destination: URL(string: "https://platform.openai.com/api-keys")!) {
-                        Label("打开 OpenAI 控制台", systemImage: "safari")
+                    Link(destination: URL(string: settings.normalizedBackendBaseURL) ?? URL(string: "https://manga.areu.pro")!) {
+                        Label("打开漫画后端", systemImage: "safari")
                     }
+                }
+            }
+            .onAppear {
+                if backendURLInput.isEmpty {
+                    backendURLInput = settings.normalizedBackendBaseURL
+                }
+                if backendKeyInput.isEmpty {
+                    backendKeyInput = KeychainService.shared.loadBackendAPIKey() ?? ""
                 }
             }
             .navigationTitle("设置")
@@ -162,12 +200,19 @@ struct SettingsView: View {
         }
     }
 
-    private func saveKey() {
-        let trimmed = apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        KeychainService.shared.saveAPIKey(trimmed)
-        settings.refreshAPIKeyStatus()
-        apiKeyInput = ""
+    private func saveBackendConfig() {
+        let trimmedURL = backendURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedURL.isEmpty {
+            settings.backendBaseURL = trimmedURL
+        }
+
+        let trimmedKey = backendKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedKey.isEmpty {
+            KeychainService.shared.saveBackendAPIKey(trimmedKey)
+        }
+
+        settings.refreshBackendStatus()
+        backendURLInput = settings.normalizedBackendBaseURL
         withAnimation { showSavedToast = true }
     }
 

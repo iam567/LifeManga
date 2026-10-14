@@ -2,7 +2,7 @@
 //  KeychainService.swift
 //  LifeManga
 //
-//  用 iOS Keychain 安全保存用户的 OpenAI API Key。
+//  用 iOS Keychain 安全保存后端凭证（以及兼容旧版 OpenAI Key 字段）。
 //
 
 import Foundation
@@ -14,15 +14,14 @@ final class KeychainService {
     private init() {}
 
     private let service = "com.lifemanga.app"
-    private let account = "openai_api_key"
+    private let openAIAccount = "openai_api_key"
+    private let backendAccount = "backend_api_key"
 
-    // MARK: - Save
+    // MARK: - Generic
 
     @discardableResult
-    func saveAPIKey(_ key: String) -> Bool {
-        guard let data = key.data(using: .utf8) else { return false }
-
-        // 先删旧的
+    func saveSecret(_ secret: String, account: String) -> Bool {
+        guard let data = secret.data(using: .utf8) else { return false }
         let queryDelete: [String: Any] = [
             kSecClass as String:       kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -42,9 +41,7 @@ final class KeychainService {
         return status == errSecSuccess
     }
 
-    // MARK: - Load
-
-    func loadAPIKey() -> String? {
+    func loadSecret(account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String:        kSecClassGenericPassword,
             kSecAttrService as String:  service,
@@ -62,10 +59,8 @@ final class KeychainService {
         return key
     }
 
-    // MARK: - Delete
-
     @discardableResult
-    func deleteAPIKey() -> Bool {
+    func deleteSecret(account: String) -> Bool {
         let query: [String: Any] = [
             kSecClass as String:       kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -73,5 +68,37 @@ final class KeychainService {
         ]
         let status = SecItemDelete(query as CFDictionary)
         return status == errSecSuccess || status == errSecItemNotFound
+    }
+
+    // MARK: - OpenAI (legacy compatibility)
+
+    @discardableResult
+    func saveAPIKey(_ key: String) -> Bool {
+        saveSecret(key, account: openAIAccount)
+    }
+
+    func loadAPIKey() -> String? {
+        loadSecret(account: openAIAccount)
+    }
+
+    @discardableResult
+    func deleteAPIKey() -> Bool {
+        deleteSecret(account: openAIAccount)
+    }
+
+    // MARK: - Backend
+
+    @discardableResult
+    func saveBackendAPIKey(_ key: String) -> Bool {
+        saveSecret(key, account: backendAccount)
+    }
+
+    func loadBackendAPIKey() -> String? {
+        loadSecret(account: backendAccount)
+    }
+
+    @discardableResult
+    func deleteBackendAPIKey() -> Bool {
+        deleteSecret(account: backendAccount)
     }
 }

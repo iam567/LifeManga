@@ -11,6 +11,40 @@
 import Foundation
 import SwiftUI
 import UIKit
+import CoreLocation
+
+enum NavigationGuideStrength: String, CaseIterable, Identifiable {
+    case light
+    case balanced
+    case strong
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .light: return "轻导览"
+        case .balanced: return "标准"
+        case .strong: return "强指引"
+        }
+    }
+
+    var promptCue: String {
+        switch self {
+        case .light:
+            return "Lean more toward a charming travel-note comic with gentle guidance."
+        case .balanced:
+            return "Balance route clarity with visual charm and readable landmark guidance."
+        case .strong:
+            return "Make this an explicit route manual with strong arrows, clear numbered steps, and unmistakable wayfinding."
+        }
+    }
+}
+
+struct SelectedImageInput: Identifiable, Equatable {
+    let id: UUID = UUID()
+    let image: UIImage
+    let diaryStamp: DiaryStamp?
+}
 
 enum GenerationPhase: Equatable {
     case idle
@@ -23,28 +57,45 @@ enum GenerationPhase: Equatable {
 @MainActor
 final class MangaGeneratorViewModel: ObservableObject {
 
+    static func maxInputImageCount(forPageCount pageCount: Int) -> Int {
+        max(6, max(1, pageCount) * 6)
+    }
+
     /// 当前所属工程
     var projectId: UUID
     /// 工程名（仅用来发通知文案）
     var projectName: String
+    let projectMode: ProjectMode
+    private var drivingTask: Task<Void, Never>?
 
-    init(projectId: UUID, projectName: String = "") {
+    init(projectId: UUID, projectName: String = "", projectMode: ProjectMode = .comicLife) {
         self.projectId = projectId
         self.projectName = projectName
+        self.projectMode = projectMode
+        if projectMode == .navigationGuide {
+            self.style = .navigationGuide
+            self.bubbleTextMode = "chinese"
+            self.isColor = true
+        }
     }
 
     // 用户选择的输入图
-    @Published var selectedImages: [UIImage] = []
+    @Published var selectedInputs: [SelectedImageInput] = []
     // "前一张" 漫画图（用于风格延续）—— 可来自历史，也可外部上传
     @Published var previousPageImage: UIImage?
     /// 关联的来源 MangaItem（如果是从历史里选的）
     @Published var previousPageSourceId: UUID?
     // 载入的角色（来自角色库）—— 角色立绘会作为参考图随请求一起发
     @Published var loadedCharacters: [Character] = []
+    @Published var selectedCharacterReferenceViewIDs: [UUID: UUID] = [:]
     // 当前风格
     @Published var style: MangaStyle = .shonenJump
     // 用户额外补充的描述
     @Published var userPrompt: String = ""
+    @Published var navigationStart: String = ""
+    @Published var navigationDestination: String = ""
+    @Published var navigationWaypoints: String = ""
+    @Published var navigationStrength: NavigationGuideStrength = .balanced
     // 故事模式开关
     @Published var storyMode: Bool = false
     // 故事模式分镜数
@@ -67,32 +118,69 @@ final class MangaGeneratorViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var errorIsSafetyBlocked: Bool = false
     @Published var lastSaved: MangaItem?
+    @Published var toastMessage: String?
+
+    var selectedImages: [UIImage] { selectedInputs.map(\.image) }
+    var activeDiaryStamp: DiaryStamp? { selectedInputs.compactMap(\.diaryStamp).first }
+    var fallbackDiaryStamp: DiaryStamp {
+        DiaryStamp(capturedAt: Date(), weatherText: nil)
+    }
 
     var isGenerating: Bool {
         phase == .generatingScript || phase == .generatingImage
     }
 
+    var isBlockingGenerate: Bool {
+        phase == .generatingScript || (storyMode && phase == .generatingImage)
+    }
+
     // MARK: - 操作
 
-    func addImage(_ img: UIImage) {
-        selectedImages.append(img)
+    @discardableResult
+    func addImage(_ img: UIImage, diaryStamp: DiaryStamp? = nil, maxCount: Int = .max) -> Bool {
+        guard selectedInputs.count < maxCount else { return false }
+        selectedInputs.append(SelectedImageInput(image: img, diaryStamp: diaryStamp))
+        return true
     }
 
     func removeImage(at index: Int) {
-        guard selectedImages.indices.contains(index) else { return }
-        selectedImages.remove(at: index)
+        guard selectedInputs.indices.contains(index) else { return }
+        selectedInputs.remove(at: index)
+    }
+
+    func moveSelectedInput(id: UUID, before targetID: UUID) {
+        guard id != targetID,
+              let fromIndex = selectedInputs.firstIndex(where: { $0.id == id }),
+              let targetIndex = selectedInputs.firstIndex(where: { $0.id == targetID }) else {
+            return
+        }
+        let item = selectedInputs.remove(at: fromIndex)
+        let adjustedTarget = fromIndex < targetIndex ? max(0, targetIndex - 1) : targetIndex
+        selectedInputs.insert(item, at: adjustedTarget)
+    }
+
+    func moveSelectedInputToEnd(id: UUID) {
+        guard let fromIndex = selectedInputs.firstIndex(where: { $0.id == id }) else { return }
+        let item = selectedInputs.remove(at: fromIndex)
+        selectedInputs.append(item)
     }
 
     func reset() {
-        selectedImages = []
+        selectedInputs = []
         previousPageImage = nil
         previousPageSourceId = nil
         loadedCharacters = []
+        selectedCharacterReferenceViewIDs = [:]
         userPrompt = ""
+        navigationStart = ""
+        navigationDestination = ""
+        navigationWaypoints = ""
+        navigationStrength = .balanced
         generatedImages = []
         generatedScript = nil
         stageMessage = ""
         lastSaved = nil
+        toastMessage = nil
         phase = .idle
     }
 
@@ -101,21 +189,50 @@ final class MangaGeneratorViewModel: ObservableObject {
         previousPageSourceId = nil
     }
 
-    func loadCharacter(_ c: Character) {
+    func loadCharacter(_ c: Character, referenceViewID: UUID? = nil) {
         if !loadedCharacters.contains(where: { $0.id == c.id }) {
             loadedCharacters.append(c)
+        }
+        if let referenceViewID {
+            selectedCharacterReferenceViewIDs[c.id] = referenceViewID
+        } else if selectedCharacterReferenceViewIDs[c.id] == nil,
+                  let defaultViewID = c.referencePortraitView?.id ?? c.preferredCoverView?.id {
+            selectedCharacterReferenceViewIDs[c.id] = defaultViewID
         }
     }
 
     func unloadCharacter(_ c: Character) {
         loadedCharacters.removeAll { $0.id == c.id }
+        selectedCharacterReferenceViewIDs.removeValue(forKey: c.id)
     }
 
-    /// 把所有载入角色的"正面"立绘（没有就退而求其次取第一张）作为参考图
+    func selectedReferenceView(for character: Character) -> CharacterView? {
+        if let selectedID = selectedCharacterReferenceViewIDs[character.id],
+           let view = character.views.first(where: { $0.id == selectedID }) {
+            return view
+        }
+        return character.referencePortraitView ?? character.preferredCoverView
+    }
+
+    func setSelectedReferenceView(_ view: CharacterView, for character: Character) {
+        selectedCharacterReferenceViewIDs[character.id] = view.id
+        if !loadedCharacters.contains(where: { $0.id == character.id }) {
+            loadedCharacters.append(character)
+        }
+    }
+
+    func selectedCharacterSelectionsSnapshot() -> [CharacterReferenceSelection] {
+        loadedCharacters.map { character in
+            CharacterReferenceSelection(characterId: character.id,
+                                        viewId: selectedReferenceView(for: character)?.id)
+        }
+    }
+
+    /// 把所有载入角色的标准立绘（没有就退而求其次取第一张）作为参考图
     func characterReferenceImages() -> [UIImage] {
         var imgs: [UIImage] = []
         for c in loadedCharacters {
-            let view = c.views.first(where: { $0.label == "正面" }) ?? c.views.first
+            let view = selectedReferenceView(for: c)
             if let n = view?.imageName, let ui = CharacterStore.shared.image(named: n) {
                 imgs.append(ui)
             } else if let n = c.sourcePhotoName,
@@ -135,6 +252,14 @@ final class MangaGeneratorViewModel: ObservableObject {
         the input set. These represent the recurring characters that should appear in this \
         page (\(names)). Match their faces, hair, outfits and overall design EXACTLY as shown. \
         Do not redesign them.
+
+        IMPORTANT REFERENCE-USE RULE:
+        Use ONLY the main standing character figure from each reference as the canonical design. \
+        Ignore any side expression heads, accessory callouts, prop layouts, object boards, arrows, \
+        labels, multi-panel sheet layout, background decorations, or extra design-sheet elements \
+        that may appear around the character in a character sheet. Those surrounding helper elements \
+        are reference aids only and must NOT be copied into the manga unless the user explicitly \
+        asked for that object or prop in the scene.
         """
     }
 
@@ -144,9 +269,31 @@ final class MangaGeneratorViewModel: ObservableObject {
         phase = .idle
     }
 
+    func startGenerate(settings: AppSettings) {
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.generate(settings: settings)
+            await MainActor.run {
+                self.drivingTask = nil
+            }
+        }
+        drivingTask = task
+    }
+
+    func startRegenerateScript(settings: AppSettings) {
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.regenerateScript(settings: settings)
+            await MainActor.run {
+                self.drivingTask = nil
+            }
+        }
+        drivingTask = task
+    }
+
     /// 主入口：根据当前 phase + storyMode 决定下一步
     func generate(settings: AppSettings) async {
-        guard !selectedImages.isEmpty else {
+        guard !selectedInputs.isEmpty else {
             errorMessage = "请先至少选择一张图片"
             return
         }
@@ -174,20 +321,27 @@ final class MangaGeneratorViewModel: ObservableObject {
     // MARK: - 普通模式
 
     private func runSimpleMode(settings: AppSettings) async {
-        phase = .generatingImage
-        stageMessage = "AI 正在绘制中…"
-
         let n = max(1, min(settings.imageCount, 4))
         let size = settings.imageSize
         let quality = settings.imageQuality
+        let effectiveDiaryStamp = resolvedDiaryStamp(diaryModeOn: settings.diaryModeOn)
+        let effectiveUserPrompt = buildEffectiveUserPrompt(
+            basePrompt: userPrompt.isEmpty ? nil : userPrompt,
+            style: style,
+            diaryStamp: effectiveDiaryStamp
+        )
 
         let req = OpenAIImageRequest(
             inputImages: selectedImages,
             previousPageImage: previousPageImage,
             characterReferenceImages: characterReferenceImages(),
             characterDirective: charactersDirective(),
-            stylePrompt: style.effectivePrompt(isColor: isColor),
-            userPrompt: userPrompt.isEmpty ? nil : userPrompt,
+            stylePrompt: style.effectivePrompt(
+                isColor: isColor,
+                stylizationStrength: settings.mangaStylizationStrength,
+                preserveRealWorldReadability: projectMode == .navigationGuide
+            ),
+            userPrompt: effectiveUserPrompt,
             n: n,
             size: size,
             quality: quality,
@@ -204,64 +358,93 @@ final class MangaGeneratorViewModel: ObservableObject {
             return
         }
 
+        let selectedImagesSnapshot = selectedImages
+        let previousPageSnapshot = previousPageImage
+        let loadedCharacterIdsSnapshot = loadedCharacters.map(\.id)
+        let loadedCharacterSelectionsSnapshot = selectedCharacterSelectionsSnapshot()
+        let userPromptSnapshot = userPrompt.isEmpty ? nil : userPrompt
+        let bubbleModeSnapshot = bubbleTextMode
+        let isColorSnapshot = isColor
+        let diaryStampSnapshot = effectiveDiaryStamp
+        let styleSnapshot = style
+        let projectIdSnapshot = projectId
+        let projectNameSnapshot = projectName
+
         // 先预分配 jobId，把输入图存到磁盘（用于"重新生成"按钮）
         let jobId = UUID()
         let pending = JobStore.shared.savePendingInputs(
             jobId: jobId,
-            inputs: selectedImages,
-            previousPage: previousPageImage
+            inputs: selectedImagesSnapshot,
+            previousPage: previousPageSnapshot
         )
 
         JobStore.shared.startJob(
             id: jobId,
             projectId: projectId,
             projectName: projectName,
-            style: style,
+            style: styleSnapshot,
             kind: .simpleImage,
             stageMessage: "已提交 OpenAI，生成可能需要 1~5 分钟…",
             inputImageFiles: pending.inputs,
             previousPageFile: pending.previous,
-            characterIds: loadedCharacters.map { $0.id },
-            userPromptText: userPrompt.isEmpty ? nil : userPrompt,
-            bubbleMode: bubbleTextMode,
-            wasColorOn: isColor,
+            characterIds: loadedCharacterIdsSnapshot,
+            characterSelections: loadedCharacterSelectionsSnapshot,
+            userPromptText: userPromptSnapshot,
+            bubbleMode: bubbleModeSnapshot,
+            wasColorOn: isColorSnapshot,
             imageCount: n,
             imageSizeStr: size,
             imageQualityStr: quality,
             requestHash: hash
         )
-        do {
-            // 不再用外层 wall-clock 砍掉请求——
-            // URLSession 已经把超时拉到 600s（足够 OpenAI 的慢路径），
-            // 客户端任何"主动放弃"都可能造成 OpenAI 已扣费但我们没拿到结果。
-            let datas = try await OpenAIService.shared.generateManga(req, jobId: jobId) { [weak self] msg in
-                self?.stageMessage = msg
-                JobStore.shared.updateStage(jobId, msg)
-            }
-            self.generatedImages = datas.compactMap { UIImage(data: $0) }
 
-            let inputDatas = selectedImages.compactMap { $0.pngData() }
-            let savedItem = MangaStorage.shared.add(
-                projectId: projectId,
-                style: style,
-                inputs: inputDatas,
-                outputs: datas,
-                userPrompt: userPrompt.isEmpty ? nil : userPrompt,
-                storyScript: nil
-            )
-            self.lastSaved = savedItem
-            phase = .done
-            JobStore.shared.complete(jobId, with: savedItem.id)
-            LocalNotifier.notifyDone(
-                title: "漫画生成完成",
-                body: "\(projectName)：\(style.displayName) · 共 \(savedItem.outputImageNames.count) 张"
-            )
-        } catch {
-            self.handleError(error)
-            phase = .idle
-            resolveJobError(error, jobId: jobId)
+        let backgroundTask = Task { [weak self] in
+            do {
+                // 普通模式提交后立即释放 UI，让用户继续切风格排队生成。
+                let datas = try await OpenAIService.shared.generateManga(req, jobId: jobId) { msg in
+                    JobStore.shared.updateStage(jobId, msg)
+                }
+
+                let inputDatas = selectedImagesSnapshot.compactMap { $0.pngData() }
+                let savedItem = MangaStorage.shared.add(
+                    projectId: projectIdSnapshot,
+                    style: styleSnapshot,
+                    inputs: inputDatas,
+                    outputs: datas,
+                    userPrompt: userPromptSnapshot,
+                    storyScript: nil,
+                    previousPage: previousPageSnapshot?.pngData(),
+                    loadedCharacterIds: loadedCharacterIdsSnapshot,
+                    loadedCharacterSelections: loadedCharacterSelectionsSnapshot,
+                    bubbleTextMode: bubbleModeSnapshot,
+                    isColorOutput: isColorSnapshot,
+                    imageCount: n,
+                    imageSize: size,
+                    imageQuality: quality,
+                    diaryStamp: diaryStampSnapshot,
+                    applyDiaryOverlay: settings.diaryOverlayAssistOn
+                )
+
+                await MainActor.run {
+                    self?.lastSaved = savedItem
+                }
+                JobStore.shared.complete(jobId, with: savedItem.id)
+                LocalNotifier.notifyDone(
+                    title: "漫画生成完成",
+                    body: "\(projectNameSnapshot)：\(styleSnapshot.displayName) · 共 \(savedItem.outputImageNames.count) 张"
+                )
+            } catch {
+                await MainActor.run {
+                    self?.handleError(error)
+                }
+                resolveJobError(error, jobId: jobId)
+            }
         }
+
+        JobStore.shared.attachTask(backgroundTask, to: jobId)
+        toastMessage = "任务已加到后台，可继续换风格生成"
         stageMessage = ""
+        phase = .idle
     }
 
     // MARK: - 故事模式 第 1 步：编剧
@@ -290,15 +473,37 @@ final class MangaGeneratorViewModel: ObservableObject {
             return
         }
         phase = .generatingImage
+        let effectiveDiaryStamp = resolvedDiaryStamp(diaryModeOn: settings.diaryModeOn)
         let req = currentStoryRequest(settings: settings)
-        let jobId = JobStore.shared.startJob(
+        let jobId = UUID()
+        let pending = JobStore.shared.savePendingInputs(
+            jobId: jobId,
+            inputs: selectedImages,
+            previousPage: previousPageImage
+        )
+        JobStore.shared.startJob(
+            id: jobId,
             projectId: projectId,
             projectName: projectName,
             style: style,
             kind: .storyRender,
             stageMessage: "AI 正在分镜作画…",
-            subtitle: script.title
+            subtitle: script.title,
+            inputImageFiles: pending.inputs,
+            previousPageFile: pending.previous,
+            characterIds: loadedCharacters.map { $0.id },
+            characterSelections: selectedCharacterSelectionsSnapshot(),
+            userPromptText: userPrompt.isEmpty ? nil : userPrompt,
+            bubbleMode: bubbleTextMode,
+            wasColorOn: isColor,
+            imageCount: 1,
+            imageSizeStr: settings.imageSize,
+            imageQualityStr: settings.imageQuality,
+            storyScriptSnapshot: script
         )
+        if let drivingTask {
+            JobStore.shared.attachTask(drivingTask, to: jobId)
+        }
         do {
             // 不再用外层 wall-clock 砍请求——URLSession 已经放到 600s
             let datas = try await OpenAIService.shared.renderStoryWithScript(
@@ -316,7 +521,17 @@ final class MangaGeneratorViewModel: ObservableObject {
                 inputs: inputDatas,
                 outputs: datas,
                 userPrompt: userPrompt.isEmpty ? nil : userPrompt,
-                storyScript: script
+                storyScript: script,
+                previousPage: previousPageImage?.pngData(),
+                loadedCharacterIds: loadedCharacters.map(\.id),
+                loadedCharacterSelections: selectedCharacterSelectionsSnapshot(),
+                bubbleTextMode: bubbleTextMode,
+                isColorOutput: isColor,
+                imageCount: 1,
+                imageSize: settings.imageSize,
+                imageQuality: settings.imageQuality,
+                diaryStamp: effectiveDiaryStamp,
+                applyDiaryOverlay: settings.diaryOverlayAssistOn
             )
             self.lastSaved = saved
             phase = .done
@@ -337,20 +552,101 @@ final class MangaGeneratorViewModel: ObservableObject {
     // MARK: - 工具
 
     private func currentStoryRequest(settings: AppSettings) -> OpenAIStoryRequest {
-        OpenAIStoryRequest(
+        let effectiveDiaryStamp = resolvedDiaryStamp(diaryModeOn: settings.diaryModeOn)
+        let effectiveUserPrompt = buildEffectiveUserPrompt(
+            basePrompt: userPrompt.isEmpty ? nil : userPrompt,
+            style: style,
+            diaryStamp: effectiveDiaryStamp
+        )
+        return OpenAIStoryRequest(
             inputImages: selectedImages,
             previousPageImage: previousPageImage,
             characterReferenceImages: characterReferenceImages(),
             characterDirective: charactersDirective(),
             style: style,
-            userHint: userPrompt.isEmpty ? nil : userPrompt,
+            userHint: effectiveUserPrompt,
             panelCount: max(2, min(panelCount, 9)),
             scriptModel: settings.scriptModel,
             size: settings.imageSize,
             quality: settings.imageQuality,
             bubbleTextMode: bubbleTextMode,
-            isColor: isColor
+            isColor: isColor,
+            stylizationStrength: settings.mangaStylizationStrength,
+            preserveRealWorldReadability: projectMode == .navigationGuide
         )
+    }
+
+    private func buildEffectiveUserPrompt(basePrompt: String?,
+                                          style: MangaStyle,
+                                          diaryStamp: DiaryStamp?) -> String? {
+        let trimmed = basePrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let memory = MangaStorage.shared.tasteMemoryPrompt(for: style)
+        let diary = diaryPrompt(for: diaryStamp)
+        let navigation = navigationPrompt()
+        return [trimmed, memory, diary, navigation]
+            .compactMap { value in
+                guard let value else { return nil }
+                let t = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return t.isEmpty ? nil : t
+            }
+            .joined(separator: "\n\n")
+            .nilIfEmpty
+    }
+
+    private func resolvedDiaryStamp(diaryModeOn: Bool) -> DiaryStamp? {
+        guard diaryModeOn else { return nil }
+        return activeDiaryStamp ?? fallbackDiaryStamp
+    }
+
+    private func diaryPrompt(for stamp: DiaryStamp?) -> String? {
+        guard let stamp else { return nil }
+        var lines: [String] = []
+        lines.append("DIARY MODE:")
+        lines.append("Treat this manga like a personal visual diary entry.")
+        lines.append("Use noticeably MORE text than normal mode — richer narration, more diary-like reflections, more inner thoughts, and clearer scene-setting notes.")
+        lines.append("If speech bubbles or caption boxes are available, make good use of them. The page should feel like a written diary memory, not a mostly silent illustration.")
+        lines.append("Prefer short but frequent text beats across the page: observations, feelings, little discoveries, mood notes, and reflective commentary.")
+        lines.append("Include a clearly visible but tasteful diary-style date stamp in one corner, showing exactly: \(stamp.dateText).")
+        if let weather = stamp.weatherText, !weather.isEmpty {
+            lines.append("Also include a subtle weather note showing \(weather).")
+        }
+        lines.append("The stamp should feel naturally integrated into the page, like a handwritten diary note or editorial corner label, without overwhelming the composition.")
+        return lines.joined(separator: "\n")
+    }
+
+    private func navigationPrompt() -> String? {
+        guard projectMode == .navigationGuide else { return nil }
+        var lines: [String] = []
+        lines.append("NAVIGATION GUIDE MODE:")
+        lines.append("This is not a normal life comic. It is a route-guidance comic that helps the viewer travel from one place to another.")
+        lines.append("Use the uploaded map screenshots, overhead map crops, and street-view images as route reference material. Convert them into a clean illustrated guide page.")
+        if !navigationStart.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.append("Start point: \(navigationStart.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        if !navigationDestination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.append("Destination: \(navigationDestination.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        let via = navigationWaypoints
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if !via.isEmpty {
+            lines.append("Waypoints / landmarks to mention in order: \(via.joined(separator: " -> "))")
+        }
+        if !selectedInputs.isEmpty {
+            lines.append("INPUT ORDER RULE:")
+            lines.append("Use the uploaded user reference images in their EXACT attached order. Treat image 1 as step 1, image 2 as step 2, image 3 as step 3, and so on, unless the first image is clearly an overview map. Do not shuffle the step order.")
+            lines.append("If one image is an overview map and the remaining images are street-view steps, show the map first as orientation, then present the street-view panels in the same order the user attached them.")
+        }
+        lines.append(navigationStrength.promptCue)
+        lines.append("ARROW RULE:")
+        lines.append("If the uploaded reference image(s) already contain route arrows, treat those arrows as the ground-truth route. Follow their direction, turning points, and forward progression strictly. Do not invent a different path, do not flip the route, and do not reinterpret the navigation.")
+        lines.append("When reference arrows are present, redraw them as polished bold blue navigation arrows with soft white outline, rounded shape, and clear wayfinding visibility — but keep the same path and turn behavior as the user's arrows.")
+        lines.append("If the uploaded reference image(s) do NOT contain arrows, do NOT add new route arrows by yourself. In that case rely on step captions, landmarks, route callouts, and the guide character instead of inventing arrows.")
+        lines.append("Prefer a step-by-step flow with route callouts, landmark recognition, and a guide character from the character library pointing the way.")
+        lines.append("If multiple pages are requested, page 1 should orient the route and early steps, later pages should continue the route and arrival.")
+        lines.append("Do not drift into unrelated slice-of-life storytelling. The primary goal is clear navigation and local guidance.")
+        return lines.joined(separator: "\n")
     }
 
     private func handleError(_ error: Error) {
@@ -360,6 +656,13 @@ final class MangaGeneratorViewModel: ObservableObject {
         } else {
             self.errorIsSafetyBlocked = false
         }
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

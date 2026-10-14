@@ -7,6 +7,7 @@
 
 import SwiftUI
 import PhotosUI
+import Photos
 
 struct HomeView: View {
     let project: MangaProject
@@ -19,7 +20,8 @@ struct HomeView: View {
         self.project = project
         _vm = StateObject(wrappedValue: MangaGeneratorViewModel(
             projectId: project.id,
-            projectName: project.name
+            projectName: project.name,
+            projectMode: project.mode
         ))
     }
 
@@ -33,6 +35,30 @@ struct HomeView: View {
     @State private var prevPickerItems: [PhotosPickerItem] = []
     // 角色选择
     @State private var showCharacterPicker = false
+    @State private var draggingInputID: UUID?
+
+    private var maxInputImageCount: Int {
+        MangaGeneratorViewModel.maxInputImageCount(forPageCount: settings.imageCount)
+    }
+
+    private var isNavigationMode: Bool {
+        project.mode == .navigationGuide
+    }
+
+    private var remainingInputImageSlots: Int {
+        max(0, maxInputImageCount - vm.selectedInputs.count)
+    }
+
+    private var canAddMoreInputImages: Bool {
+        remainingInputImageSlots > 0
+    }
+
+    private var inputLimitHint: String {
+        if settings.imageCount <= 1 {
+            return "可以拍 1~6 张照片，或从相册选"
+        }
+        return "当前是 \(settings.imageCount) 页模式，最多可选 \(maxInputImageCount) 张素材；系统会按每页最多 6 张自动分组连续生成"
+    }
 
     var body: some View {
         ScrollView {
@@ -41,14 +67,21 @@ struct HomeView: View {
                 inputSection
                 previousPageSection
                 charactersSection
-                styleSection
+                if isNavigationMode {
+                    navigationGuideSection
+                } else {
+                    styleSection
+                }
                 colorModeSection
+                diaryModeSection
                 bubbleModeSection
-                storyModeSection
+                if !isNavigationMode {
+                    storyModeSection
+                }
                 promptSection
                 generateButton
 
-                if vm.isGenerating { progressSection }
+                if vm.isBlockingGenerate { progressSection }
 
                 if vm.generatedScript != nil {
                     editableScriptCard
@@ -68,33 +101,60 @@ struct HomeView: View {
         }
         // 相机
         .sheet(isPresented: $showCamera) {
-            ImagePickerView(sourceType: .camera) { img in
-                vm.addImage(img)
+            ImagePickerView(sourceType: .camera) { img, _ in
+                Task {
+                    let stamp = settings.diaryModeOn ? DiaryStamp(capturedAt: Date(), weatherText: nil) : nil
+                    if !vm.addImage(img, diaryStamp: stamp, maxCount: maxInputImageCount) {
+                        await MainActor.run {
+                            vm.toastMessage = "当前最多可添加 \(maxInputImageCount) 张素材"
+                        }
+                    }
+                }
             }
             .ignoresSafeArea()
         }
         // 相册多选
         .photosPicker(isPresented: $showLibrary,
                       selection: $photoPickerItems,
-                      maxSelectionCount: 6,
+                      maxSelectionCount: max(1, remainingInputImageSlots),
                       matching: .images)
         .onChange(of: photoPickerItems) { _, items in
             Task {
                 for item in items {
                     if let data = try? await item.loadTransferable(type: Data.self),
                        let img = UIImage(data: data) {
-                        vm.addImage(img)
+                        let stamp = settings.diaryModeOn ? await diaryStamp(for: item) : nil
+                        if !vm.addImage(img, diaryStamp: stamp, maxCount: maxInputImageCount) {
+                            await MainActor.run {
+                                vm.toastMessage = "当前最多可添加 \(maxInputImageCount) 张素材"
+                            }
+                            break
+                        }
                     }
                 }
                 photoPickerItems = []
             }
         }
         .onAppear {
-            vm.style = settings.defaultStyle
-            vm.storyMode = settings.storyModeOn
+            vm.style = isNavigationMode ? .navigationGuide : settings.defaultStyle
+            vm.storyMode = isNavigationMode ? false : settings.storyModeOn
             vm.panelCount = settings.panelCount
             vm.bubbleTextMode = settings.bubbleTextMode
-            vm.isColor = settings.isColor
+            vm.isColor = isNavigationMode ? true : settings.isColor
+        }
+        .overlay(alignment: .top) {
+            if let toastMessage = vm.toastMessage {
+                Text(toastMessage)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding(.top, 16)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .task {
+                        try? await Task.sleep(nanoseconds: 1_600_000_000)
+                        withAnimation { vm.toastMessage = nil }
+                    }
+            }
         }
         .alert(vm.errorIsSafetyBlocked ? "图片被安全系统拒绝" : "出错了",
                isPresented: .init(
@@ -106,7 +166,7 @@ struct HomeView: View {
             } else {
                 Button("立即重试") {
                     vm.errorMessage = nil
-                    Task { await vm.generate(settings: settings) }
+                    vm.startGenerate(settings: settings)
                 }
                 Button("好", role: .cancel) { vm.errorMessage = nil }
             }
@@ -115,6 +175,7 @@ struct HomeView: View {
         }
         .sheet(item: $detailItem) { item in
             NavigationStack { MangaDetailView(item: item) }
+                .environmentObject(settings)
         }
         // 前一张：选择来源（本工程历史 vs 相册）
         .sheet(isPresented: $showPrevPickerSheet) {
@@ -139,12 +200,16 @@ struct HomeView: View {
         .sheet(isPresented: $showCharacterPicker) {
             CharacterPickerSheet(
                 selected: vm.loadedCharacters.map { $0.id },
-                onToggle: { character in
+                selectedReferenceViewIDs: vm.selectedCharacterReferenceViewIDs,
+                onToggle: { character, view in
                     if vm.loadedCharacters.contains(where: { $0.id == character.id }) {
-                        vm.unloadCharacter(character)
+                        vm.loadCharacter(character, referenceViewID: view?.id)
                     } else {
-                        vm.loadCharacter(character)
+                        vm.loadCharacter(character, referenceViewID: view?.id)
                     }
+                },
+                onRemove: { character in
+                    vm.unloadCharacter(character)
                 }
             )
             .presentationDetents([.medium, .large])
@@ -178,13 +243,23 @@ struct HomeView: View {
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 10) {
-                        ForEach(Array(vm.selectedImages.enumerated()), id: \.offset) { idx, img in
+                        ForEach(Array(vm.selectedInputs.enumerated()), id: \.element.id) { idx, input in
                             ZStack(alignment: .topTrailing) {
-                                Image(uiImage: img)
-                                    .resizable()
-                                    .scaledToFill()
-                                    .frame(width: 110, height: 110)
-                                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                                ZStack(alignment: .bottomLeading) {
+                                    Image(uiImage: input.image)
+                                        .resizable()
+                                        .scaledToFill()
+                                        .frame(width: 110, height: 110)
+                                        .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                                    Text("\(idx + 1)")
+                                        .font(.caption.bold())
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 5)
+                                        .background(.black.opacity(0.7), in: Capsule())
+                                        .padding(8)
+                                }
                                 Button { vm.removeImage(at: idx) } label: {
                                     Image(systemName: "xmark.circle.fill")
                                         .foregroundStyle(.white, .black.opacity(0.7))
@@ -192,9 +267,33 @@ struct HomeView: View {
                                 }
                                 .offset(x: 6, y: -6)
                             }
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 14)
+                                    .stroke(draggingInputID == input.id ? Color.accentColor : .clear, lineWidth: 3)
+                            )
+                            .scaleEffect(draggingInputID == input.id ? 1.04 : 1.0)
+                            .animation(.spring(duration: 0.22), value: draggingInputID)
+                            .onDrag {
+                                draggingInputID = input.id
+                                return NSItemProvider(object: input.id.uuidString as NSString)
+                            }
+                            .dropDestination(for: String.self) { items, _ in
+                                guard let source = items.first,
+                                      let sourceID = UUID(uuidString: source) else { return false }
+                                vm.moveSelectedInput(id: sourceID, before: input.id)
+                                draggingInputID = nil
+                                return true
+                            } isTargeted: { targeted in
+                                if !targeted, draggingInputID == input.id {
+                                    draggingInputID = nil
+                                }
+                            }
                         }
                     }
                 }
+                Text("长按图片可拖动排序；导航案内会尽量按这个顺序排步骤。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
             HStack(spacing: 12) {
@@ -205,7 +304,7 @@ struct HomeView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!UIImagePickerController.isSourceTypeAvailable(.camera))
+                .disabled(!UIImagePickerController.isSourceTypeAvailable(.camera) || !canAddMoreInputImages)
 
                 Button {
                     showLibrary = true
@@ -214,6 +313,7 @@ struct HomeView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                .disabled(!canAddMoreInputImages)
             }
         }
         .padding()
@@ -228,7 +328,7 @@ struct HomeView: View {
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading) {
                 Text("还没有图片").font(.subheadline)
-                Text("可以拍 1~6 张照片，或从相册选")
+                Text(inputLimitHint)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -264,7 +364,8 @@ struct HomeView: View {
                     HStack(spacing: 10) {
                         ForEach(vm.loadedCharacters) { c in
                             ZStack(alignment: .topTrailing) {
-                                LoadedCharacterChip(character: c)
+                                LoadedCharacterChip(character: c,
+                                                    selectedView: vm.selectedReferenceView(for: c))
                                 Button { vm.unloadCharacter(c) } label: {
                                     Image(systemName: "xmark.circle.fill")
                                         .foregroundStyle(.white, .black.opacity(0.7))
@@ -369,6 +470,57 @@ struct HomeView: View {
         }
     }
 
+    private var navigationGuideSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "map.fill")
+                    .foregroundStyle(.green)
+                Text("2. 导览设置").font(.headline)
+                Spacer()
+                Label("导航案内", systemImage: "arrow.triangle.turn.up.right.diamond.fill")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.green)
+            }
+            Text("这一模式会把地图俯视图、街景截图和角色向导一起组织成路线说明漫画。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("起点").font(.subheadline.weight(.medium))
+                TextField("例如：东京站八重洲口", text: $vm.navigationStart)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("终点").font(.subheadline.weight(.medium))
+                TextField("例如：酒店 / 咖啡店 / 某个景点入口", text: $vm.navigationDestination)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("途经点 / 地标（每行一个，可选）").font(.subheadline.weight(.medium))
+                TextField("例如：\n7-Eleven 路口\n地铁 A2 出口\n红色天桥", text: $vm.navigationWaypoints, axis: .vertical)
+                    .lineLimit(3...5)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            HStack {
+                Text("导览强度").font(.subheadline.weight(.medium))
+                Spacer()
+                Picker("", selection: $vm.navigationStrength) {
+                    ForEach(NavigationGuideStrength.allCases) { strength in
+                        Text(strength.displayName).tag(strength)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 240)
+            }
+        }
+        .padding()
+        .background(Color(.systemGray6))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+
     // MARK: 色彩模式
     private var colorModeSection: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -380,6 +532,45 @@ struct HomeView: View {
             HStack(spacing: 10) {
                 ColorModeCard(isColor: false, selected: !vm.isColor) { vm.isColor = false }
                 ColorModeCard(isColor: true,  selected: vm.isColor)  { vm.isColor = true }
+            }
+        }
+        .padding()
+        .background(Color(.systemGray6))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+
+    private var diaryModeSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "book.closed.fill")
+                    .foregroundStyle(.indigo)
+                Text("日记模式").font(.headline)
+                Spacer()
+                Toggle("", isOn: $settings.diaryModeOn)
+                    .labelsHidden()
+            }
+            Text(settings.diaryModeOn
+                 ? diaryModeHint()
+                 : "打开后，系统会优先读取第一张照片的拍摄时间；如果照片带定位，还会尝试自动附加当天当地天气，让漫画更像日记页。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            if settings.diaryModeOn {
+                Divider()
+                HStack(spacing: 10) {
+                    Image(systemName: "calendar.badge.clock")
+                        .foregroundStyle(.indigo)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("补强日期戳")
+                            .font(.subheadline.weight(.medium))
+                        Text("AI 没把日期稳定画出来时，再额外叠一张本地日期卡片；如果 AI 已经画出来了，可以关掉避免重复。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Toggle("", isOn: $settings.diaryOverlayAssistOn)
+                        .labelsHidden()
+                }
             }
         }
         .padding()
@@ -424,6 +615,30 @@ struct HomeView: View {
         AppSettings.bubbleTextModes.first { $0.id == vm.bubbleTextMode }?.hint ?? ""
     }
 
+    private func diaryModeHint() -> String {
+        if let stamp = vm.activeDiaryStamp {
+            if let weather = stamp.weatherText, !weather.isEmpty {
+                return "将按第一张照片生成日记戳：\(stamp.dateText) · \(weather)"
+            }
+            return "将按第一张照片生成日记戳：\(stamp.dateText) · 未读到天气"
+        }
+        return "已开启。优先读取第一张照片的拍摄时间；如果暂时没读到元数据，也会自动用当前日期补一个日记戳。"
+    }
+
+    private func diaryStamp(for item: PhotosPickerItem) async -> DiaryStamp? {
+        guard let identifier = item.itemIdentifier else { return nil }
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        guard let asset = result.firstObject else { return nil }
+        let capturedAt = asset.creationDate ?? Date()
+        let weather: String?
+        if let location = asset.location {
+            weather = await DiaryWeatherService.shared.weatherText(for: location.coordinate, at: capturedAt)
+        } else {
+            weather = nil
+        }
+        return DiaryStamp(capturedAt: capturedAt, weatherText: weather)
+    }
+
     // MARK: 故事模式区
     private var storyModeSection: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -463,15 +678,27 @@ struct HomeView: View {
 
     private var promptSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(vm.storyMode ? "3. 故事方向（可选）" : "3. 补充描述（可选）")
+            Text(promptSectionTitle)
                 .font(.headline)
-            TextField(vm.storyMode
-                      ? "例如：悬疑 / 父子情 / 一场误会 / 穿越异世界"
-                      : "例如：把主角画成戴墨镜的中学生",
+            TextField(promptPlaceholder,
                       text: $vm.userPrompt, axis: .vertical)
                 .lineLimit(2...4)
                 .textFieldStyle(.roundedBorder)
         }
+    }
+
+    private var promptSectionTitle: String {
+        if isNavigationMode { return "3. 导览补充说明（可选）" }
+        return vm.storyMode ? "3. 故事方向（可选）" : "3. 补充描述（可选）"
+    }
+
+    private var promptPlaceholder: String {
+        if isNavigationMode {
+            return "例如：突出便利店招牌、让角色多做指路手势、在终点加到达提示"
+        }
+        return vm.storyMode
+            ? "例如：悬疑 / 父子情 / 一场误会 / 穿越异世界"
+            : "例如：把主角画成戴墨镜的中学生"
     }
 
     @ViewBuilder
@@ -481,7 +708,7 @@ struct HomeView: View {
             // 剧本已就绪：让用户选择"重新构思"或"用这个剧本作画"
             HStack(spacing: 10) {
                 Button {
-                    Task { await vm.regenerateScript(settings: settings) }
+                    vm.startRegenerateScript(settings: settings)
                 } label: {
                     Label("重新构思", systemImage: "arrow.triangle.2.circlepath")
                         .frame(maxWidth: .infinity)
@@ -490,7 +717,7 @@ struct HomeView: View {
                 .buttonStyle(.bordered)
 
                 Button {
-                    Task { await vm.generate(settings: settings) }
+                    vm.startGenerate(settings: settings)
                 } label: {
                     Label("用这个剧本作画", systemImage: "paintbrush.pointed.fill")
                         .frame(maxWidth: .infinity)
@@ -501,7 +728,7 @@ struct HomeView: View {
 
         default:
             Button {
-                Task { await vm.generate(settings: settings) }
+                vm.startGenerate(settings: settings)
             } label: {
                 HStack {
                     Image(systemName: vm.storyMode ? "book.pages.fill" : "wand.and.stars")
@@ -512,12 +739,13 @@ struct HomeView: View {
                 .padding(.vertical, 14)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(vm.isGenerating || vm.selectedImages.isEmpty)
+            .disabled(vm.isBlockingGenerate || vm.selectedImages.isEmpty)
         }
     }
 
     private var buttonLabel: String {
-        if vm.isGenerating { return "正在生成…" }
+        if vm.isBlockingGenerate { return "正在生成…" }
+        if isNavigationMode { return "生成导览漫画" }
         return vm.storyMode ? "构思剧情" : "生成漫画"
     }
 
@@ -807,10 +1035,11 @@ private struct ColorModeCard: View {
 
 private struct LoadedCharacterChip: View {
     let character: Character
+    let selectedView: CharacterView?
     @ObservedObject private var store = CharacterStore.shared
 
     private var thumb: UIImage? {
-        if let v = character.views.first(where: { $0.label == "正面" }) ?? character.views.first {
+        if let v = selectedView ?? character.preferredCoverView {
             return store.image(named: v.imageName)
         }
         return nil
@@ -838,7 +1067,9 @@ private struct LoadedCharacterChip: View {
 
 private struct CharacterPickerSheet: View {
     let selected: [UUID]
-    let onToggle: (Character) -> Void
+    let selectedReferenceViewIDs: [UUID: UUID]
+    let onToggle: (Character, CharacterView?) -> Void
+    let onRemove: (Character) -> Void
     @ObservedObject private var store = CharacterStore.shared
     @Environment(\.dismiss) private var dismiss
 
@@ -857,7 +1088,10 @@ private struct CharacterPickerSheet: View {
                     ScrollView {
                         LazyVGrid(columns: columns, spacing: 12) {
                             ForEach(store.characters) { c in
-                                Button { onToggle(c) } label: {
+                                Button {
+                                    let view = selectedView(for: c)
+                                    onToggle(c, view)
+                                } label: {
                                     pickerCell(c)
                                 }
                                 .buttonStyle(.plain)
@@ -880,10 +1114,11 @@ private struct CharacterPickerSheet: View {
     @ViewBuilder
     private func pickerCell(_ c: Character) -> some View {
         let isSelected = selected.contains(c.id)
+        let view = selectedView(for: c)
         VStack(spacing: 4) {
             ZStack(alignment: .topTrailing) {
                 RoundedRectangle(cornerRadius: 10).fill(Color(.systemGray5))
-                if let v = c.views.first(where: { $0.label == "正面" }) ?? c.views.first,
+                if let v = view,
                    let img = store.image(named: v.imageName) {
                     Image(uiImage: img).resizable().scaledToFill()
                 } else {
@@ -904,7 +1139,51 @@ private struct CharacterPickerSheet: View {
                     .stroke(isSelected ? Color.indigo : Color.clear, lineWidth: 2)
             )
             Text(c.name).font(.caption).lineLimit(1)
+            if c.views.count > 1 {
+                Text(view?.label ?? "选择风格")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+            }
+            if c.views.count > 1 {
+                Menu {
+                    ForEach(c.views) { view in
+                        Button {
+                            onToggle(c, view)
+                        } label: {
+                            if selectedReferenceViewIDs[c.id] == view.id {
+                                Label(view.label, systemImage: "checkmark")
+                            } else {
+                                Text(view.label)
+                            }
+                        }
+                    }
+                    if isSelected {
+                        Divider()
+                        Button("移除角色", role: .destructive) {
+                            onRemove(c)
+                        }
+                    }
+                } label: {
+                    Label("切换风格", systemImage: "swatchpalette")
+                        .font(.caption2)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color(.systemGray6))
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
         }
+    }
+
+    private func selectedView(for character: Character) -> CharacterView? {
+        if let selectedID = selectedReferenceViewIDs[character.id],
+           let view = character.views.first(where: { $0.id == selectedID }) {
+            return view
+        }
+        return character.referencePortraitView ?? character.preferredCoverView
     }
 }
 
